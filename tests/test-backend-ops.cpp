@@ -10295,6 +10295,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 5120, 1, 17408, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1}));
     }
+    // batched decode (several sequences per step) through the mat-vec path
+    for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q4_0}) {
+        for (int n : {2, 4, 8}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
