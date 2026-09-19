@@ -55,10 +55,10 @@ Stock llama.cpp cannot run these files. Bonsai 2 needs the fork's Hadamard activ
 ## Run
 
 ```
-.\bonsai2-5500m\start-server.ps1               # PTQ1_0 on Vulkan, 16k context
+.\bonsai2-5500m\start-server.ps1               # PTQ1_0 on Vulkan, 32k context
 .\bonsai2-5500m\start-server.ps1 -Lan          # listen on 0.0.0.0 for other machines on the LAN
 .\bonsai2-5500m\start-server.ps1 -Cpu          # CPU-only fallback (uses PQ2_0)
-.\bonsai2-5500m\start-server.ps1 -- --reasoning-budget 2048    # extra llama-server flags after --
+.\bonsai2-5500m\start-server.ps1 --reasoning-budget 2048    # unknown flags pass straight to llama-server
 ```
 
 Then open http://localhost:8080. The launcher's defaults exist to fit in 8 GB of VRAM:
@@ -66,8 +66,31 @@ Then open http://localhost:8080. The launcher's defaults exist to fit in 8 GB of
 - `-np 1`: every server slot allocates its own recurrent-state cache, and the default of 4 runs out of memory.
 - `--no-mmproj-offload`: the 0.63 GB vision projector stays in system RAM. Text speed is unaffected and
   image encoding is slower. `-MmprojGpu` puts it back on the GPU if you have room.
-- `-Ctx 16384` is the default because it is the largest that fits. 20k and 24k run out of memory, and so
-  does 32k even with an 8-bit KV cache. On a card with more VRAM, raise it with `-Ctx`.
+- 32k context with a mixed KV cache: 8-bit keys and 4-bit values (`-CacheK q8_0 -CacheV q4_0`).
+  Keys are the half that loses accuracy when compressed, so they keep 8 bits.
+
+KV cache options measured on this card (same short prompt, fresh server each time):
+
+| Keys / values | Context | Fits? | Decode |
+|---|---|---|---|
+| f16 / f16 | 16k | yes | 14.1 tok/s |
+| f16 / f16 | 20k, 24k | out of memory | |
+| q8_0 / q8_0 | 16k | yes | 14.1 tok/s |
+| q8_0 / q8_0 | 32k | yes, but VRAM is nearly full | 9.1 tok/s |
+| **q8_0 / q4_0 (default)** | **32k** | **yes** | **14.2 tok/s** |
+| q4_0 / q4_0 | 32k | yes | 14.2 tok/s |
+
+Quality cost of the default cache, measured as WikiText-2 perplexity (lower is better, same text for both):
+
+| Window | f16 / f16 | q8_0 / q4_0 | Change |
+|---|---|---|---|
+| 2k tokens, 10 chunks | 7.1790 | 7.1737 | -0.07% (noise) |
+| 16k tokens, 1 chunk | 4.6921 | 4.7092 | +0.36% |
+
+The 16k window is the most full precision can hold on this card, so it is the fairest long-context comparison.
+A 21,500-token recall test also passed with the default: the model found a code word planted near the start.
+
+For full-precision cache use `-CacheK f16 -CacheV f16 -Ctx 16384`. On a card with more VRAM, raise `-Ctx`.
 
 `-Lan` exposes an unauthenticated API. Only use it on a network you trust, or add `-- --api-key <key>`.
 

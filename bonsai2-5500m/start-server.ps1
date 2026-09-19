@@ -3,7 +3,8 @@
   Start llama-server for Bonsai 2 27B with the tuned Vulkan settings and serve the chat UI.
 
 .EXAMPLE
-  .\start-server.ps1                 # Vulkan, PTQ1_0, localhost:8080
+  .\start-server.ps1                 # Vulkan, PTQ1_0, 32k context, KV cache q8_0 keys + q4_0 values
+  .\start-server.ps1 -CacheK f16 -CacheV f16 -Ctx 16384   # full-precision KV cache; 16k is its limit in 8 GB
   .\start-server.ps1 -Lan            # also reachable from other machines on the LAN
   .\start-server.ps1 -Model pq2      # use the PQ2_0 file instead
   .\start-server.ps1 -Cpu            # CPU only (PQ2_0), for machines without a usable GPU
@@ -18,14 +19,18 @@
   script, then a "models" folder beside the repo checkout. The server binary is expected at
   <repo>\build\bin\llama-server.exe (the default CMake build folder).
 #>
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [ValidateSet("ptq1", "pq2")] [string] $Model = "ptq1",
     [switch] $Lan,
     [switch] $Cpu,
     [switch] $NoVision,
     [switch] $MmprojGpu,
-    [int]    $Ctx = 16384,
+    [int]    $Ctx = 32768,
+    # KV cache precision. On the 8 GB 5500M at 32k: q8_0/q8_0 fits but decode drops to ~9 tok/s (VRAM
+    # nearly full); q8_0 keys + q4_0 values keeps ~14 tok/s. Keys are the precision-sensitive half.
+    [ValidateSet("f16", "q8_0", "q4_0")] [string] $CacheK = "q8_0",
+    [ValidateSet("f16", "q8_0", "q4_0")] [string] $CacheV = "q4_0",
     [int]    $Port = 8080,
     [int]    $Ngl = 99,
     [int]    $Parallel = 1,
@@ -61,6 +66,7 @@ $Args_ = @(
     "-ngl", "$Ngl", "-fa", "on",
     "-c", "$Ctx",
     "-np", "$Parallel",
+    "-ctk", $CacheK, "-ctv", $CacheV,
     "--temp", "1.0", "--top-p", "0.95", "--top-k", "20",
     "--jinja",
     "--path", $WebUI,
@@ -82,7 +88,7 @@ Write-Host ""
 Write-Host "=== Bonsai 2 27B / llama-server ===" -ForegroundColor Green
 Write-Host "  Model:   $Gguf"
 Write-Host ("  Backend: " + $(if ($Ngl -gt 0) { "Vulkan, -ngl $Ngl" } else { "CPU" }))
-Write-Host "  Context: $Ctx"
+Write-Host "  Context: $Ctx (KV cache K=$CacheK V=$CacheV)"
 Write-Host ("  UI:      http://localhost:$Port" + $(if ($Lan) { "  (LAN: http://$((Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.*' } | Select-Object -First 1).IPAddress):$Port)" } else { "" }))
 Write-Host "  API:     http://localhost:$Port/v1/chat/completions"
 Write-Host "  Ctrl+C stops the server."
