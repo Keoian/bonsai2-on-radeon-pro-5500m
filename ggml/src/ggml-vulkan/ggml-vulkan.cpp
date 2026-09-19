@@ -8025,6 +8025,8 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
     if (b_type == GGML_TYPE_Q8_1) {
         switch (a_type) {
             case GGML_TYPE_Q2_0:
+            case GGML_TYPE_PTQ1_0:
+            case GGML_TYPE_PQ2_0:
             case GGML_TYPE_Q4_0:
             case GGML_TYPE_Q4_1:
             case GGML_TYPE_Q5_0:

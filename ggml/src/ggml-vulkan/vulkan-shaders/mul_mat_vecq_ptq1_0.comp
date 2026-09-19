@@ -1,41 +1,15 @@
 #version 450
 
-// PTQ1_0 x q8_1 matrix-vector product using integer dot products.
+// PTQ1_0 x q8_1 mat-vec with integer dot products.
 //
-// A PTQ1_0 block is 28 bytes: qs[24] (five base-3 trits per byte), qh[2] (four
-// trits per byte) and an fp16 scale d. Element order is not positional:
-//   qs[j], j < 16   : element t*16 + j          (t = 0..4)
-//   qs[16 + j], j<8 : element 80 + t*8 + j      (t = 0..4)
-//   qh[h]           : element 120 + n*2 + h     (n = 0..3)
-// Trits come out of a byte by the recurrence  trit_n = (v*3) >> 8,  v = (v*3) & 0xFF,
-// which this shader runs on two bytes at a time in the 16-bit halves of a dword.
-// A trit q in {0,1,2} decodes to the weight (q - 1) * d, so with q8_1 activations
-//   sum_e (q_e - 1) * y_e  =  sum_k ( d_b[k] * sum_{e in k} q_e * q8_e  -  s_b[k] )
-// where k indexes the four 32-element q8_1 sub-blocks and s_b = d_b * sum(q8).
+// Block: 28 bytes = qs[24] (5 base-3 trits per byte), qh[2] (4 trits per byte), fp16 d. Element order is not positional:
+//   qs[j], j < 16: element t*16 + j (t = 0..4);  qs[16 + j], j < 8: element 80 + t*8 + j;  qh[h]: element 120 + 2n + h
+// Trit level t of a byte: trit = (v*3) >> 8, v = (v*3) & 0xFF. This shader runs that on two bytes at a time in the 16-bit halves of a dword.
+// Weight = (trit - 1) * d, so with q8_1 activations: sum_e (q_e - 1) * y_e = sum_k (d_b[k] * sum_{e in k} q_e * q8_e - s_b[k]), s_b = d_b * sum(q8).
 //
-// Two lanes share one 128-element block: lane sub=0 decodes qs dwords 0..2
-// (elements t*16 + 0..11), lane sub=1 decodes qs dwords 3..5 (elements t*16 + 12..15
-// and 80 + t*8 + 0..7) plus qh. Both lanes run the same instruction stream; only
-// indices differ, so there is no divergence inside a subgroup.
-//
-// Two code paths, chosen per pipeline by the (specialization) constant column
-// count:
-//  - one column (single-sequence decode): bandwidth bound. Activations of a block
-//    are loaded once, then every row is decoded and dotted straight away with the
-//    residue-tolerant trick described at TRIT_LEVEL below.
-//  - several columns (batched decode, e.g. llama-server slots): ALU bound.
-//    Columns are handled in groups of CG, and each group makes its own pass over
-//    the blocks (later passes re-read the same few rows of A from cache). Per block
-//    the lane decodes the trits of all NUM_ROWS rows level by level and dots each
-//    freshly decoded, packed level with the activations of every column of the
-//    group, so an extra column costs three loads and three dot products per row and
-//    level while the decode is shared. Integer accumulators are folded into the
-//    fp32 result whenever the level moves on to a new q8_1 sub-block scale.
-//    Separate passes keep the compiler from hoisting the loads of all groups to
-//    the top of the block body, which blows up the register count (and spills at
-//    NUM_COLS = 8). They are written as guarded calls rather than a loop because
-//    the driver does not unroll a loop that contains the block loop, and a dynamic
-//    column index wrecks the kernel.
+// Two lanes per 128-element block: sub=0 takes qs dwords 0..2, sub=1 takes qs dwords 3..5 and qh. Same instruction stream, no divergence.
+// One column (single sequence, bandwidth bound): load the activations of a block once, then decode and dot each row with the residue-tolerant trick (see TRIT_LEVEL).
+// Several columns (batched decode, ALU bound): passes of CG columns; per block decode all rows once per level, pack the trits and dot them with every column of the pass.
 
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_EXT_integer_dot_product : require
@@ -78,12 +52,8 @@ uint a_offset, b_offset, d_offset;
 #define DOT4(a, b, acc) dotPacked4x8AccSatEXT((a), (b), (acc))
 #endif
 
-// Decode one trit level from the two 16-bit lanes held in vl (bytes 0,2) and
-// vh (bytes 1,3) and accumulate the dot product with the matching activations.
-// After w = v*3 (< 768 per lane) the trit sits in byte 1 (lane 0) / byte 3 (lane 1)
-// and the residue v' in byte 0 / byte 2. The activation words are pre-masked so
-// that bytes 0 and 2 are zero, which makes the dot product ignore the residue
-// bytes: yh has y1,y3 in bytes 1,3 and yl has y0,y2 moved to bytes 1,3.
+// One trit level from the 16-bit lanes vl (bytes 0,2) and vh (bytes 1,3): after w = v*3 the trit is in byte 1/3 and the residue in byte 0/2.
+// The activation words are pre-masked (bytes 0,2 zero; yh = y1,y3 in bytes 1,3; yl = y0,y2 moved to bytes 1,3), so the dot product ignores the residue.
 #define TRIT_LEVEL(vl, vh, yl, yh, acc)          \
     {                                            \
         const uint wl = MUL3(vl);                \
@@ -107,16 +77,12 @@ uint arow[NUM_ROWS];   // dword offset of the first block of each row
 uint bcol[NUM_COLS];   // block_q8_1_x4 index of the first block of each column
 FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
 
-// One pass over the blocks for the columns j0 .. j0 + CG - 1 (fewer in the last
-// group when NUM_COLS is not a multiple of CG). j0 is a literal at every call
-// site, so all column indices are static after inlining.
+// One pass over the blocks for columns j0 .. j0 + CG - 1 (fewer in the last group). j0 is a literal at each call site, so column indices stay static.
 void process_group(const uint j0) {
     const uint nc = min(CG, NUM_COLS - j0);
 
     if (nc == 1u) {
-        // Single column. The row loop has a runtime bound, which keeps only one
-        // row's decode state live; that costs fewer registers than the level-major
-        // loop below and streams the weights a little faster.
+        // Single column: the row loop has a runtime bound, which keeps one row of decode state live (fewer registers than the level-major loop below).
         for (uint blk = blk_first; blk < num_blocks_per_row; blk += blk_stride) {
             const uint bx4   = bcol[j0] + blk;
             const uint bbase = bx4 * Q8_1_X4_DWORDS + 4u;
@@ -127,10 +93,7 @@ void process_group(const uint j0) {
             const vec2 ds2 = unpackHalf2x16(dsraw.z);
             const vec2 ds3 = unpackHalf2x16(dsraw.w);
 
-            // Accumulator -> sub-block scale mapping. accA[t/2] always holds elements of
-            // sub-block t/2. accB[t/2] holds sub-block t/2 on lane 0 and sub-block
-            // (80 + 8t)/32 on lane 1 (2,2,3,3,3 for t = 0..4). Each lane subtracts the
-            // sums of the two sub-blocks it "owns" so every s_b[k] is counted once.
+            // accA[t/2] holds sub-block t/2. accB[t/2] holds sub-block t/2 on lane 0 and sub-block (80 + 8t)/32 on lane 1 (2,2,3,3,3). Each lane subtracts the sums of its own two sub-blocks.
             const float sA0 = ds0.x;
             const float sA1 = ds1.x;
             const float sA2 = ds2.x;
@@ -139,9 +102,7 @@ void process_group(const uint j0) {
             const float sB2 = (sub != 0u) ? ds3.x : ds2.x;
             const float bias = (sub != 0u) ? (ds2.y + ds3.y) : (ds0.y + ds1.y);
 
-            // Activations for this lane's three qs dwords at each trit level. Both lanes
-            // issue the same two vector loads per level (16-byte at dword 4t, 8-byte at
-            // dword 20+2t) and pick their words from the registers.
+            // Activations per trit level: both lanes issue the same two vector loads (16 bytes at dword 4t, 8 bytes at dword 20+2t) and pick their words.
             int32_t yh0[5], yh1[5], yh2[5];
             int32_t yl0[5], yl1[5], yl2[5];
             [[unroll]] for (uint t = 0; t < 5; ++t) {
@@ -201,8 +162,7 @@ void process_group(const uint j0) {
                 TRIT_LEVEL_LAST(v1l, v1h, yl1[4], yh1[4], accB2);
                 TRIT_LEVEL_LAST(v2l, v2h, yl2[4], yh2[4], accB2);
 
-                // qh: four trit levels of two bytes -> elements 120 + 2n + h, all in
-                // sub-block 3 (accB2 on lane 1). Lane 0 decodes zeros and adds nothing.
+                // qh: four trit levels of two bytes -> elements 120 + 2n + h, all in sub-block 3 (accB2 on lane 1). Lane 0 decodes zeros.
                 {
                     uint vq = (sub != 0u) ? ((w6 & 0xFFu) | ((w6 & 0xFF00u) << 8u)) : 0u;
                     uint wq;
@@ -232,8 +192,7 @@ void process_group(const uint j0) {
 
     {
         for (uint blk = blk_first; blk < num_blocks_per_row; blk += blk_stride) {
-            // The three qs dwords of this lane for every row, split into 16-bit lanes
-            // (l = bytes 0,2 ; h = bytes 1,3), plus the qh/d dword and the row scale.
+            // qs dwords of this lane for every row, split into 16-bit lanes (l = bytes 0,2; h = bytes 1,3), plus the qh/d dword and the row scale.
             uint  v0l[NUM_ROWS], v0h[NUM_ROWS];
             uint  v1l[NUM_ROWS], v1h[NUM_ROWS];
             uint  v2l[NUM_ROWS], v2h[NUM_ROWS];
@@ -262,11 +221,7 @@ void process_group(const uint j0) {
                 dsraw[jj] = data_b_u128[bx4[jj] * Q8_1_X4_UVEC4];
             }
 
-            // accA accumulates dword 0 (elements t*16 + 0..3 / 12..15), always in
-            // sub-block t/2. accB accumulates dwords 1 and 2: on lane 0 these are
-            // elements t*16 + 4..11 (sub-block t/2), on lane 1 elements 80 + 8t + 0..7
-            // (sub-block 2,2,3,3,3). Both change scale after levels 1 and 3, so they are
-            // folded into temp at the same points with their own scales.
+            // accA: dword 0, always sub-block t/2. accB: dwords 1,2, sub-block t/2 on lane 0 and 2,2,3,3,3 on lane 1. Both change scale after levels 1 and 3.
             int32_t accA[CG][NUM_ROWS];
             int32_t accB[CG][NUM_ROWS];
             [[unroll]] for (uint jj = 0; jj < CG; ++jj) {
@@ -277,10 +232,7 @@ void process_group(const uint j0) {
             }
 
             [[unroll]] for (uint t = 0; t < 5; ++t) {
-                // The three activation words of this lane for every column at this
-                // level: lane 0 dwords 4t .. 4t+2, lane 1 dwords 4t+3, 20+2t, 21+2t.
-                // Exactly these words are loaded (three registers per column and
-                // level; the compiler hoists the loads of all levels, so this matters).
+                // The three activation words of this lane per column: lane 0 dwords 4t..4t+2, lane 1 dwords 4t+3, 20+2t, 21+2t. Only these are loaded: the compiler hoists the loads of all levels, so registers matter.
                 int32_t yp0[CG], yp1[CG], yp2[CG];
                 [[unroll]] for (uint jj = 0; jj < nc; ++jj) {
                     const uint bbase = bx4[jj] * Q8_1_X4_DWORDS + 4u;
@@ -307,9 +259,7 @@ void process_group(const uint j0) {
                         v2l[n] = w2l & 0x00FF00FFu;
                         v2h[n] = w2h & 0x00FF00FFu;
                     }
-                    // Pack the four trits of each dword (bytes 0,2 sit in bytes 1,3 of
-                    // wl, bytes 1,3 in bytes 1,3 of wh) and dot with the plain
-                    // activation words: three dots per column.
+                    // Pack the four trits of each dword (bytes 0,2 from wl, bytes 1,3 from wh) and dot with the plain activation words: three dots per column.
                     const int32_t q0 = int32_t(((w0l >> 8u) & 0x00FF00FFu) | (w0h & 0xFF00FF00u));
                     const int32_t q1 = int32_t(((w1l >> 8u) & 0x00FF00FFu) | (w1h & 0xFF00FF00u));
                     const int32_t q2 = int32_t(((w2l >> 8u) & 0x00FF00FFu) | (w2h & 0xFF00FF00u));
@@ -321,9 +271,7 @@ void process_group(const uint j0) {
                 }
 
                 if (t == 4u) {
-                    // qh: four trit levels of two bytes -> elements 120 + 2n + h, all in
-                    // sub-block 3, which is the scale of accB on lane 1 at this level.
-                    // Lane 0 decodes zeros and adds nothing.
+                    // qh: four trit levels of two bytes -> elements 120 + 2n + h, all in sub-block 3 (the scale of accB on lane 1 at this level). Lane 0 decodes zeros.
                     int32_t yq0[CG], yq1[CG];
                     [[unroll]] for (uint jj = 0; jj < nc; ++jj) {
                         const uint  bbase = bx4[jj] * Q8_1_X4_DWORDS + 4u;
@@ -349,9 +297,7 @@ void process_group(const uint j0) {
                     }
                 }
 
-                // Fold the integer sums into the fp32 result when the sub-block scale
-                // changes (after levels 1 and 3) and at the end. The ternary offset
-                // (- sum(q8) of the sub-blocks this lane owns) is applied once, at the end.
+                // Fold into fp32 when the sub-block scale changes (after levels 1 and 3) and at the end; the ternary offset (-sum(q8) of the owned sub-blocks) is applied once at the end.
                 if (t == 1u || t == 3u || t == 4u) {
                     [[unroll]] for (uint jj = 0; jj < nc; ++jj) {
                         {
@@ -404,9 +350,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     first_row_g = first_row;
     num_rows_g  = num_rows;
 
-    // The multi-column path loops over the constant NUM_ROWS so every array index
-    // is static; rows past the matrix (last workgroup only) re-read the last valid
-    // row, and their results are never stored by reduce_result.
+    // The multi-column path loops over the constant NUM_ROWS. Rows past the matrix (last workgroup) re-read the last valid row; reduce_result does not store them.
     [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
         arow[n] = (a_offset + (first_row + min(n, num_rows - 1u)) * num_blocks_per_row) * PTQ1_0_DWORDS;
     }
@@ -421,8 +365,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         }
     }
 
-    // One pass per column group. NUM_COLS is at most mul_mat_vec_max_cols (8);
-    // the guards are constant after specialization.
+    // One pass per column group, as guarded calls: the driver does not unroll a loop that contains the block loop, and one loop over all columns makes it hoist every load (spills at NUM_COLS = 8). NUM_COLS <= mul_mat_vec_max_cols (8).
     process_group(0u);
     if (NUM_COLS > 1u*CG) process_group(1u*CG);
     if (NUM_COLS > 2u*CG) process_group(2u*CG);
