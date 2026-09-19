@@ -25,7 +25,7 @@ param(
     [switch] $Cpu,
     [switch] $NoVision,
     [switch] $MmprojGpu,
-    [int]    $Ctx = 32768,
+    [int]    $Ctx = 16384,
     [int]    $Port = 8080,
     [int]    $Ngl = 99,
     [int]    $Parallel = 1,

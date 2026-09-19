@@ -55,7 +55,7 @@ Stock llama.cpp cannot run these files. Bonsai 2 needs the fork's Hadamard activ
 ## Run
 
 ```
-.\bonsai2-5500m\start-server.ps1               # PTQ1_0 on Vulkan, 32k context
+.\bonsai2-5500m\start-server.ps1               # PTQ1_0 on Vulkan, 16k context
 .\bonsai2-5500m\start-server.ps1 -Lan          # listen on 0.0.0.0 for other machines on the LAN
 .\bonsai2-5500m\start-server.ps1 -Cpu          # CPU-only fallback (uses PQ2_0)
 .\bonsai2-5500m\start-server.ps1 -- --reasoning-budget 2048    # extra llama-server flags after --
@@ -66,7 +66,8 @@ Then open http://localhost:8080. The launcher's defaults exist to fit in 8 GB of
 - `-np 1`: every server slot allocates its own recurrent-state cache, and the default of 4 runs out of memory.
 - `--no-mmproj-offload`: the 0.63 GB vision projector stays in system RAM. Text speed is unaffected and
   image encoding is slower. `-MmprojGpu` puts it back on the GPU if you have room.
-- If you still see `ErrorOutOfDeviceMemory`, lower `-Ctx` first.
+- `-Ctx 16384` is the default because it is the largest that fits. 20k and 24k run out of memory, and so
+  does 32k even with an 8-bit KV cache. On a card with more VRAM, raise it with `-Ctx`.
 
 `-Lan` exposes an unauthenticated API. Only use it on a network you trust, or add `-- --api-key <key>`.
 
