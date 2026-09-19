@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bonsai Chat</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --border: #dde1e6; --text: #1b1f24; --muted: #5c6670;
+    --accent: #2f7d4f; --accent-soft: #e3f2e9; --user: #e8eef7; --code: #eef1f4; --danger: #b3261e;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #101418; --panel: #171c22; --border: #2a323c; --text: #e6e9ed; --muted: #8b95a1;
+      --accent: #5fbf85; --accent-soft: #1d3327; --user: #1f2937; --code: #0d1117; --danger: #f28b82;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #101418; --panel: #171c22; --border: #2a323c; --text: #e6e9ed; --muted: #8b95a1;
+    --accent: #5fbf85; --accent-soft: #1d3327; --user: #1f2937; --code: #0d1117; --danger: #f28b82;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .pill {
+    font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--border);
+    color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40vw;
+  }
+  .pill.ok { border-color: var(--accent); color: var(--accent); }
+  .pill.bad { border-color: var(--danger); color: var(--danger); }
+  .spacer { flex: 1; }
+  button {
+    font: inherit; padding: 6px 12px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--text); cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--danger); }
+  button:disabled { opacity: .5; cursor: default; }
+  main { flex: 1; display: flex; min-height: 0; }
+  #chat { flex: 1; overflow-y: auto; padding: 16px; scroll-behavior: smooth; }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  .msg { margin: 0 0 18px; }
+  .msg .role { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .msg.user .body { background: var(--user); border-radius: 12px; padding: 10px 14px; white-space: pre-wrap; }
+  .msg.user img { max-width: 240px; max-height: 240px; display: block; margin-top: 8px; border-radius: 8px; }
+  .msg.assistant .body { padding: 2px 0; }
+  .body p { margin: 0 0 10px; }
+  .body pre { background: var(--code); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; overflow-x: auto; }
+  .body code { font-family: ui-monospace, Consolas, "Cascadia Mono", monospace; font-size: 13px; }
+  .body :not(pre) > code { background: var(--code); padding: 1px 5px; border-radius: 4px; }
+  .body ul, .body ol { margin: 0 0 10px; padding-left: 24px; }
+  .body h1, .body h2, .body h3 { margin: 12px 0 6px; font-size: 1.05em; }
+  .body table { border-collapse: collapse; margin: 0 0 10px; }
+  .body td, .body th { border: 1px solid var(--border); padding: 4px 8px; }
+  details.think { margin: 0 0 10px; border-left: 3px solid var(--border); padding-left: 10px; color: var(--muted); }
+  details.think summary { cursor: pointer; font-size: 13px; }
+  details.think .tbody { white-space: pre-wrap; font-size: 13px; margin-top: 4px; }
+  .stats { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .cursor::after { content: "▍"; color: var(--accent); animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .error { color: var(--danger); }
+  footer { background: var(--panel); border-top: 1px solid var(--border); padding: 10px 16px; }
+  .composer { display: flex; gap: 8px; align-items: flex-end; }
+  textarea {
+    flex: 1; font: inherit; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); resize: none; min-height: 44px; max-height: 40vh;
+  }
+  textarea:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+  .attach { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 12px; color: var(--muted); }
+  .attach[hidden] { display: none; }
+  .attach img { height: 40px; border-radius: 4px; }
+  aside {
+    width: 320px; background: var(--panel); border-left: 1px solid var(--border);
+    padding: 14px; overflow-y: auto; display: none;
+  }
+  aside.open { display: block; }
+  aside h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 14px 0 6px; }
+  aside label { display: block; font-size: 13px; margin: 8px 0 3px; }
+  aside input, aside select, aside textarea {
+    width: 100%; font: inherit; font-size: 13px; padding: 6px 8px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--text);
+  }
+  aside textarea { min-height: 70px; }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  .hint { font-size: 12px; color: var(--muted); margin: 4px 0 0; }
+  .presets { display: flex; gap: 6px; margin-top: 6px; }
+  .presets button { font-size: 12px; padding: 4px 8px; }
+  @media (max-width: 720px) {
+    aside { position: fixed; right: 0; top: 0; bottom: 0; width: min(92vw, 340px); z-index: 5; box-shadow: -4px 0 20px rgba(0,0,0,.3); }
+    .pill { max-width: 30vw; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Bonsai Chat</h1>
+  <span id="status" class="pill">connecting…</span>
+  <span class="spacer"></span>
+  <button id="newChat" title="Clear the conversation">New chat</button>
+  <button id="toggleSettings" title="Settings">⚙ Settings</button>
+</header>
+
+<main>
+  <div id="chat"><div class="wrap" id="messages"></div></div>
+  <aside id="settings">
+    <h2>Server</h2>
+    <label>llama-server URL</label>
+    <input id="serverUrl" type="text" placeholder="http://localhost:8080">
+    <p class="hint" id="serverInfo"></p>
+
+    <h2>Thinking</h2>
+    <label>Reasoning effort</label>
+    <select id="reasoning">
+      <option value="0">Off (no thinking)</option>
+      <option value="512">Low (512 tokens)</option>
+      <option value="2048">Medium (2048 tokens)</option>
+      <option value="8192">High (8192 tokens)</option>
+      <option value="-1">Max (unlimited)</option>
+    </select>
+    <p class="hint">Sent per request as <code>thinking_budget_tokens</code>. On slow GPUs, Medium keeps most of the quality at a bounded wait.</p>
+
+    <h2>Sampling</h2>
+    <div class="presets">
+      <button id="presetThink" type="button">Thinking preset</button>
+      <button id="presetNoThink" type="button">Non-thinking preset</button>
+    </div>
+    <div class="row">
+      <div><label>Temperature</label><input id="temp" type="number" step="0.05" min="0" max="2"></div>
+      <div><label>Top-p</label><input id="topP" type="number" step="0.05" min="0" max="1"></div>
+    </div>
+    <div class="row">
+      <div><label>Top-k</label><input id="topK" type="number" step="1" min="0"></div>
+      <div><label>Presence penalty</label><input id="presence" type="number" step="0.1" min="0" max="2"></div>
+    </div>
+    <label>Max reply tokens (-1 = unlimited)</label>
+    <input id="maxTokens" type="number" step="256" min="-1">
+
+    <h2>System prompt</h2>
+    <textarea id="systemPrompt" placeholder="(optional)"></textarea>
+
+    <h2>Appearance</h2>
+    <select id="theme">
+      <option value="">Follow system</option>
+      <option value="light">Light</option>
+      <option value="dark">Dark</option>
+    </select>
+    <p class="hint">Settings are saved in this browser only.</p>
+  </aside>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="composer">
+      <textarea id="input" rows="1" placeholder="Message… (Enter to send, Shift+Enter for a new line)"></textarea>
+      <button id="attachBtn" title="Attach an image (needs the server started with --mmproj)">🖼</button>
+      <input id="fileInput" type="file" accept="image/*" hidden>
+      <button id="send" class="primary">Send</button>
+    </div>
+    <div id="attachRow" class="attach" hidden>
+      <img id="attachPreview" alt="">
+      <span id="attachName"></span>
+      <button id="attachClear" type="button">remove</button>
+    </div>
+  </div>
+</footer>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const els = {
+    status: $('status'), messages: $('messages'), chat: $('chat'), input: $('input'), send: $('send'),
+    settings: $('settings'), serverUrl: $('serverUrl'), serverInfo: $('serverInfo'), reasoning: $('reasoning'),
+    temp: $('temp'), topP: $('topP'), topK: $('topK'), presence: $('presence'), maxTokens: $('maxTokens'),
+    systemPrompt: $('systemPrompt'), theme: $('theme'), attachBtn: $('attachBtn'), fileInput: $('fileInput'),
+    attachRow: $('attachRow'), attachPreview: $('attachPreview'), attachName: $('attachName'), attachClear: $('attachClear'),
+  };
+
+  // ---------- storage (best effort) ----------
+  const store = {
+    get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+    set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+  };
+
+  const defaultServer = (location.protocol === 'http:' || location.protocol === 'https:') ? location.origin : 'http://localhost:8080';
+  const settings = Object.assign({
+    serverUrl: defaultServer, reasoning: '2048', temp: 1.0, topP: 0.95, topK: 20, presence: 0,
+    maxTokens: -1, systemPrompt: '', theme: '',
+  }, store.get('bonsai.settings', {}));
+
+  const PRESET_THINK   = { temp: 1.0, topP: 0.95, topK: 20, presence: 0 };
+  const PRESET_NOTHINK = { temp: 0.7, topP: 0.8,  topK: 20, presence: 1.5 };
+
+  function applySettingsToForm() {
+    els.serverUrl.value = settings.serverUrl; els.reasoning.value = settings.reasoning;
+    els.temp.value = settings.temp; els.topP.value = settings.topP; els.topK.value = settings.topK;
+    els.presence.value = settings.presence; els.maxTokens.value = settings.maxTokens;
+    els.systemPrompt.value = settings.systemPrompt; els.theme.value = settings.theme;
+    document.documentElement.dataset.theme = settings.theme;
+  }
+  function readForm() {
+    settings.serverUrl = els.serverUrl.value.trim().replace(/\/+$/, '') || defaultServer;
+    settings.reasoning = els.reasoning.value;
+    settings.temp = parseFloat(els.temp.value); settings.topP = parseFloat(els.topP.value);
+    settings.topK = parseInt(els.topK.value, 10); settings.presence = parseFloat(els.presence.value);
+    settings.maxTokens = parseInt(els.maxTokens.value, 10);
+    settings.systemPrompt = els.systemPrompt.value; settings.theme = els.theme.value;
+    document.documentElement.dataset.theme = settings.theme;
+    store.set('bonsai.settings', settings);
+  }
+  applySettingsToForm();
+  els.settings.addEventListener('change', readForm);
+  els.settings.addEventListener('input', readForm);
+  els.serverUrl.addEventListener('change', () => checkServer());
+  $('presetThink').onclick = () => { Object.assign(settings, PRESET_THINK); if (settings.reasoning === '0') settings.reasoning = '2048'; applySettingsToForm(); store.set('bonsai.settings', settings); };
+  $('presetNoThink').onclick = () => { Object.assign(settings, PRESET_NOTHINK, { reasoning: '0' }); applySettingsToForm(); store.set('bonsai.settings', settings); };
+  $('toggleSettings').onclick = () => els.settings.classList.toggle('open');
+
+  // ---------- server status ----------
+  let serverProps = null;
+  async function checkServer() {
+    els.status.className = 'pill'; els.status.textContent = 'connecting…';
+    try {
+      const r = await fetch(settings.serverUrl + '/props', { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      serverProps = await r.json();
+      const model = (serverProps.model_alias || serverProps.model_path || 'model').split(/[\\/]/).pop();
+      const ctx = serverProps.default_generation_settings && serverProps.default_generation_settings.n_ctx;
+      els.status.className = 'pill ok';
+      els.status.textContent = model + (ctx ? ' · ctx ' + ctx.toLocaleString() : '');
+      els.status.title = model;
+      els.serverInfo.textContent = 'Connected. ' + (serverProps.build_info ? 'Build ' + serverProps.build_info + '. ' : '') +
+        (serverProps.total_slots ? serverProps.total_slots + ' slot(s).' : '');
+    } catch (e) {
+      serverProps = null;
+      els.status.className = 'pill bad'; els.status.textContent = 'server unreachable';
+      els.serverInfo.textContent = 'Cannot reach ' + settings.serverUrl + ' (' + e.message + '). Is llama-server running?';
+    }
+  }
+  checkServer();
+  setInterval(() => { if (!streaming) checkServer(); }, 30000);
+
+  // ---------- conversation ----------
+  let history = store.get('bonsai.history', []);   // [{role, content, reasoning?, image?, stats?}]
+  let streaming = false, abort = null, pendingImage = null;
+
+  function saveHistory() { store.set('bonsai.history', history.slice(-100)); }
+
+  function scrollToBottom() { els.chat.scrollTop = els.chat.scrollHeight; }
+
+  function renderAll() {
+    els.messages.innerHTML = '';
+    history.forEach(m => els.messages.appendChild(renderMessage(m)));
+    scrollToBottom();
+  }
+
+  function renderMessage(m) {
+    const div = document.createElement('div');
+    div.className = 'msg ' + m.role;
+    const role = document.createElement('div'); role.className = 'role';
+    role.textContent = m.role === 'user' ? 'You' : 'Bonsai';
+    div.appendChild(role);
+    if (m.role === 'assistant' && (m.reasoning || m.thinking)) {
+      div.appendChild(renderThink(m));
+    }
+    const body = document.createElement('div'); body.className = 'body';
+    if (m.role === 'user') {
+      body.textContent = m.content;
+      if (m.image) { const img = document.createElement('img'); img.src = m.image; body.appendChild(img); }
+    } else {
+      body.innerHTML = md(m.content || '');
+      if (m.error) { const e = document.createElement('div'); e.className = 'error'; e.textContent = m.error; body.appendChild(e); }
+    }
+    div.appendChild(body);
+    if (m.stats) { const s = document.createElement('div'); s.className = 'stats'; s.textContent = m.stats; div.appendChild(s); }
+    return div;
+  }
+
+  function renderThink(m) {
+    const d = document.createElement('details'); d.className = 'think';
+    if (m.thinking) d.open = true;
+    const s = document.createElement('summary');
+    s.textContent = m.thinking ? 'Thinking…' : 'Thinking (' + (m.reasoning || '').length.toLocaleString() + ' chars)';
+    const b = document.createElement('div'); b.className = 'tbody'; b.textContent = m.reasoning || '';
+    d.appendChild(s); d.appendChild(b);
+    return d;
+  }
+
+  // ---------- minimal markdown ----------
+  function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  function inline(s) {
+    return esc(s)
+      .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+      .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, '$1<em>$2</em>')
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  }
+  function md(src) {
+    const out = [];
+    const lines = src.replace(/\r\n?/g, '\n').split('\n');
+    let i = 0, para = [];
+    const flush = () => { if (para.length) { out.push('<p>' + inline(para.join('\n')).replace(/\n/g, '<br>') + '</p>'); para = []; } };
+    while (i < lines.length) {
+      const l = lines[i];
+      let m;
+      if ((m = l.match(/^```(\w*)/))) {
+        flush(); const code = []; i++;
+        while (i < lines.length && !lines[i].startsWith('```')) code.push(lines[i++]);
+        i++;
+        out.push('<pre><code' + (m[1] ? ' class="lang-' + esc(m[1]) + '"' : '') + '>' + esc(code.join('\n')) + '</code></pre>');
+        continue;
+      }
+      if ((m = l.match(/^(#{1,6})\s+(.*)/))) { flush(); const h = Math.min(3, m[1].length); out.push('<h' + h + '>' + inline(m[2]) + '</h' + h + '>'); i++; continue; }
+      if (/^\s*[-*+]\s+/.test(l)) {
+        flush(); out.push('<ul>');
+        while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) out.push('<li>' + inline(lines[i++].replace(/^\s*[-*+]\s+/, '')) + '</li>');
+        out.push('</ul>'); continue;
+      }
+      if (/^\s*\d+[.)]\s+/.test(l)) {
+        flush(); out.push('<ol>');
+        while (i < lines.length && /^\s*\d+[.)]\s+/.test(lines[i])) out.push('<li>' + inline(lines[i++].replace(/^\s*\d+[.)]\s+/, '')) + '</li>');
+        out.push('</ol>'); continue;
+      }
+      if (/^\s*\|.*\|\s*$/.test(l) && i + 1 < lines.length && /^\s*\|?\s*:?-{2,}/.test(lines[i + 1])) {
+        flush(); const rows = [];
+        while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) rows.push(lines[i++]);
+        const cells = r => r.trim().replace(/^\||\|$/g, '').split('|').map(c => inline(c.trim()));
+        out.push('<table><thead><tr>' + cells(rows[0]).map(c => '<th>' + c + '</th>').join('') + '</tr></thead><tbody>' +
+          rows.slice(2).map(r => '<tr>' + cells(r).map(c => '<td>' + c + '</td>').join('') + '</tr>').join('') + '</tbody></table>');
+        continue;
+      }
+      if (/^\s*(---|\*\*\*)\s*$/.test(l)) { flush(); out.push('<hr>'); i++; continue; }
+      if (l.trim() === '') { flush(); i++; continue; }
+      para.push(l); i++;
+    }
+    flush();
+    return out.join('');
+  }
+
+  // ---------- image attach ----------
+  els.attachBtn.onclick = () => els.fileInput.click();
+  els.fileInput.onchange = () => {
+    const f = els.fileInput.files[0]; if (!f) return;
+    const rd = new FileReader();
+    rd.onload = () => { pendingImage = rd.result; els.attachPreview.src = pendingImage; els.attachName.textContent = f.name; els.attachRow.hidden = false; };
+    rd.readAsDataURL(f);
+  };
+  els.attachClear.onclick = () => { pendingImage = null; els.fileInput.value = ''; els.attachRow.hidden = true; };
+
+  // ---------- sending ----------
+  function apiMessages() {
+    const msgs = [];
+    if (settings.systemPrompt.trim()) msgs.push({ role: 'system', content: settings.systemPrompt.trim() });
+    for (const m of history) {
+      if (m.role === 'user') {
+        if (m.image) msgs.push({ role: 'user', content: [{ type: 'text', text: m.content }, { type: 'image_url', image_url: { url: m.image } }] });
+        else msgs.push({ role: 'user', content: m.content });
+      } else if (m.role === 'assistant' && m.content) {
+        msgs.push({ role: 'assistant', content: m.content });
+      }
+    }
+    return msgs;
+  }
+
+  async function send() {
+    if (streaming) { if (abort) abort.abort(); return; }
+    const text = els.input.value.trim();
+    if (!text && !pendingImage) return;
+    history.push({ role: 'user', content: text, image: pendingImage || undefined });
+    els.input.value = ''; autosize(); els.attachClear.onclick();
+    const reply = { role: 'assistant', content: '', reasoning: '', thinking: false };
+    history.push(reply);
+    renderAll();
+    await stream(reply);
+    saveHistory();
+  }
+
+  async function stream(reply) {
+    streaming = true; abort = new AbortController();
+    els.send.textContent = 'Stop'; els.send.classList.remove('primary'); els.send.classList.add('danger');
+    const node = els.messages.lastElementChild;
+    const bodyEl = node.querySelector('.body'); bodyEl.classList.add('cursor');
+    let thinkEl = null, thinkBody = null, statsEl = null;
+    const t0 = performance.now(); let firstTok = 0, ntok = 0, timings = null;
+
+    const body = {
+      messages: apiMessages(), stream: true, timings_per_token: false,
+      temperature: settings.temp, top_p: settings.topP, top_k: settings.topK,
+      presence_penalty: settings.presence,
+      thinking_budget_tokens: parseInt(settings.reasoning, 10),
+    };
+    if (settings.maxTokens > 0) body.max_tokens = settings.maxTokens;
+    if (settings.reasoning === '0') body.chat_template_kwargs = { enable_thinking: false };
+
+    const refresh = () => {
+      bodyEl.innerHTML = md(reply.content);
+      if (reply.reasoning && !thinkEl) {
+        reply.thinking = true; thinkEl = renderThink(reply); thinkBody = thinkEl.querySelector('.tbody');
+        node.insertBefore(thinkEl, bodyEl);
+      }
+      if (thinkBody) thinkBody.textContent = reply.reasoning;
+      if (!statsEl) { statsEl = document.createElement('div'); statsEl.className = 'stats'; node.appendChild(statsEl); }
+      const el = (performance.now() - (firstTok || t0)) / 1000;
+      statsEl.textContent = ntok ? ntok + ' tok · ' + (ntok / Math.max(el, .001)).toFixed(1) + ' tok/s (live)' : 'waiting for first token…';
+      const nearBottom = els.chat.scrollHeight - els.chat.scrollTop - els.chat.clientHeight < 120;
+      if (nearBottom) els.chat.scrollTop = els.chat.scrollHeight;
+    };
+
+    try {
+      const r = await fetch(settings.serverUrl + '/v1/chat/completions', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: abort.signal,
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status + ': ' + (await r.text()).slice(0, 300));
+      const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = '';
+      let raf = 0; const schedule = () => { if (!raf) raf = requestAnimationFrame(() => { raf = 0; refresh(); }); };
+      while (true) {
+        const { value, done } = await reader.read(); if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, idx).trim(); buf = buf.slice(idx + 1);
+          if (!line.startsWith('data:')) continue;
+          const data = line.slice(5).trim(); if (data === '[DONE]') continue;
+          let j; try { j = JSON.parse(data); } catch { continue; }
+          if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
+          if (j.timings) timings = j.timings;
+          const d = j.choices && j.choices[0] && j.choices[0].delta;
+          if (d) {
+            if (d.reasoning_content) { reply.reasoning += d.reasoning_content; ntok++; if (!firstTok) firstTok = performance.now(); }
+            if (d.content) { reply.content += d.content; ntok++; if (!firstTok) firstTok = performance.now(); if (thinkEl) { reply.thinking = false; thinkEl.open = false; } }
+          }
+          schedule();
+        }
+      }
+    } catch (e) {
+      if (e.name === 'AbortError') reply.error = '(stopped)'; else reply.error = 'Error: ' + e.message;
+    }
+    reply.thinking = false;
+    if (thinkEl) { thinkEl.open = false; thinkEl.querySelector('summary').textContent = 'Thinking (' + reply.reasoning.length.toLocaleString() + ' chars)'; }
+    bodyEl.classList.remove('cursor');
+    const el = (performance.now() - (firstTok || t0)) / 1000;
+    if (timings) {
+      reply.stats = timings.predicted_n + ' tok · ' + Number(timings.predicted_per_second).toFixed(2) + ' tok/s' +
+        ' · prompt ' + timings.prompt_n + ' tok @ ' + Number(timings.prompt_per_second).toFixed(1) + ' tok/s' +
+        (timings.cache_n ? ' (' + timings.cache_n + ' cached)' : '');
+    } else if (ntok) {
+      reply.stats = ntok + ' tok · ' + (ntok / Math.max(el, .001)).toFixed(2) + ' tok/s (client-measured)';
+    }
+    if (statsEl) statsEl.textContent = reply.stats || '';
+    if (reply.error) { const e = document.createElement('div'); e.className = 'error'; e.textContent = reply.error; bodyEl.appendChild(e); }
+    streaming = false; abort = null;
+    els.send.textContent = 'Send'; els.send.classList.add('primary'); els.send.classList.remove('danger');
+    els.input.focus();
+  }
+
+  els.send.onclick = send;
+  els.input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
+  function autosize() { els.input.style.height = 'auto'; els.input.style.height = Math.min(els.input.scrollHeight, window.innerHeight * .4) + 'px'; }
+  els.input.addEventListener('input', autosize);
+  $('newChat').onclick = () => { if (streaming && abort) abort.abort(); history = []; saveHistory(); renderAll(); els.input.focus(); };
+
+  renderAll();
+  els.input.focus();
+})();
+</script>
+</body>
+</html>
