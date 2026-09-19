@@ -8251,11 +8251,6 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
                 wg2 <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
     GGML_ASSERT(ctx->descriptor_set_idx < ctx->descriptor_sets.size());
     GGML_ASSERT(descriptor_buffer_infos.size() <= MAX_PARAMETER_COUNT);
-    // FADI-DIAG: include the pipeline name so mismatches identify themselves
-    if (pipeline->parameter_count != descriptor_buffer_infos.size()) {
-        std::cerr << "VK descriptor mismatch: pipeline '" << pipeline->name << "' expects "
-                  << pipeline->parameter_count << " descriptors, got " << descriptor_buffer_infos.size() << std::endl;
-    }
     GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
     GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
 
@@ -10116,14 +10111,23 @@ static bool ggml_vk_can_fuse_mul_fwht(const ggml_backend_vk_context * ctx, const
     const ggml_tensor * signs = (x == mul->src[0]) ? mul->src[1] : mul->src[0];
     const int64_t n = mm->src[0]->ne[0];
     const int fwht_idx = ggml_vk_fwht_pipeline_idx(n);
-    const bool ok = fwht_idx >= 0 && // FADI-FIX: n must be a supported FWHT width (64..8192 pow2), else the signed dispatch would read pipeline_fwht_signed_*[-1]
+    // The signed pipeline must exist (some devices leave FWHT pipelines null)
+    // and the signs tensor must bind at offset 0: the shader indexes data_s from
+    // zero, so a view whose buffer offset is not representable without rounding
+    // down (allow_misalign) would silently read the preceding tensor's data.
+    const bool signed_pipeline_exists =
+        fwht_idx >= 0 &&
+        (x->type == GGML_TYPE_F16 ? ctx->device->pipeline_fwht_signed_f16[fwht_idx]
+                                  : ctx->device->pipeline_fwht_signed_f32[fwht_idx]) != nullptr;
+    const bool signs_aligned = get_misalign_bytes(ctx, signs) == 0;
+    const bool ok = signed_pipeline_exists &&
         signs->type == GGML_TYPE_F32 &&
         signs->ne[1] == 1 && signs->ne[2] == 1 && signs->ne[3] == 1 &&
         (x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16) &&
         mul->type == x->type &&
         ggml_is_contiguous(x) && ggml_is_contiguous(signs) &&
         signs->ne[0] == x->ne[0] && signs->ne[0] % n == 0 &&
-        ggml_vk_fwht_pipeline_idx(n) >= 0;
+        signs_aligned;
     if (ok && mm_dist != nullptr) {
         *mm_dist = dist;
     }
@@ -17434,19 +17438,22 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
         const char *fusion_string {};
+        int mm_fwht_dist = 0;
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
             if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
-            } else if (ggml_vk_can_fuse_mul_fwht(ctx, cgraph, i)) {
+            } else if (ggml_vk_can_fuse_mul_fwht(ctx, cgraph, i, &mm_fwht_dist)) {
                 // FADI-FUSION: MUL(x, signs) feeding the FWHT-hinted MUL_MAT — apply the
                 // sign vector inside the FWHT kernel instead of a separate elementwise launch.
-                ctx->num_additional_fused_ops = 1;
+                // mm_fwht_dist counts the empty reshape/view ops between the MUL and the
+                // matmul; every covered position must be accounted for so the framework
+                // tracks the real matmul destination.
+                ctx->num_additional_fused_ops = mm_fwht_dist;
                 fusion_string = "MUL_FWHT";
-                op_srcs_fused_elementwise[0] = false;
-                op_srcs_fused_elementwise[1] = false;
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ADD_ADD";
@@ -18850,15 +18857,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 ggml_is_contiguous(op->src[1]) &&
                 ggml_is_contiguous(op);
         default:
-            {
-                // FADI-DIAG: log hybrid-SSM ops Vulkan rejects so we can see scheduler fallbacks
-                if (op->op == GGML_OP_SSM_CONV || op->op == GGML_OP_SSM_SCAN ||
-                    op->op == GGML_OP_GATED_DELTA_NET || op->op == GGML_OP_GATED_LINEAR_ATTN ||
-                    op->op == GGML_OP_RWKV_WKV6 || op->op == GGML_OP_RWKV_WKV7) {
-                    fprintf(stderr, "VK_REJECT op=%s\n", ggml_op_name(op->op));
-                }
-                return false;
-            }
+            return false;
     }
 
     UNUSED(dev);

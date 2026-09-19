@@ -129,13 +129,7 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 #if defined(DATA_A_PTQ1_0)
 #include "ptq1_0.glsl"
 
-// FADI-OPT: vectorized PTQ1_0 decode. The codec layout guarantees that any
-// 4-aligned group of elements within a 128-weight block shares a single
-// recurrence exponent n and reads consecutive bytes (qs[e&15..+3] in region 1,
-// qs[16+j..+3] in region 2), so the whole group decodes with one branch, four
-// byte loads and a vector multiply — instead of re-running the elementwise
-// 3-way branch chain per element. Region 3 (tail, 8 elements) alternates two
-// bytes with paired exponents. Bit-identical to the scalar form.
+// FADI-OPT: any 4-aligned group shares one exponent n and reads consecutive bytes, so one branch + vector multiply decodes it.
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     return vec2(ptq1_0_trit(ib, a_offset, iqs), ptq1_0_trit(ib, a_offset, iqs + 1u));
 }
