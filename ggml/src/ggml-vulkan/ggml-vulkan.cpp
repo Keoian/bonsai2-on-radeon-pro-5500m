@@ -6269,6 +6269,21 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         const char* GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM = getenv("GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM");
         device->disable_host_visible_vidmem = GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM != nullptr;
+        if (!device->disable_host_visible_vidmem) {
+            // Without resizable BAR, host-visible vidmem is a small (typically 256 MiB) window shared with the rest of the
+            // system. Buffers placed there are demoted to system memory under pressure (seen on Windows AMD), so only use it
+            // when it is large.
+            const vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+            bool large_bar = false;
+            for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+                const vk::MemoryPropertyFlags flags = mem_props.memoryTypes[i].propertyFlags;
+                if ((flags & vk::MemoryPropertyFlagBits::eDeviceLocal) && (flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
+                    mem_props.memoryHeaps[mem_props.memoryTypes[i].heapIndex].size >= 1024ull * 1024 * 1024) {
+                    large_bar = true;
+                }
+            }
+            device->disable_host_visible_vidmem = !large_bar;
+        }
 
         const char* GGML_VK_ALLOW_SYSMEM_FALLBACK = getenv("GGML_VK_ALLOW_SYSMEM_FALLBACK");
         device->allow_sysmem_fallback = GGML_VK_ALLOW_SYSMEM_FALLBACK != nullptr;
