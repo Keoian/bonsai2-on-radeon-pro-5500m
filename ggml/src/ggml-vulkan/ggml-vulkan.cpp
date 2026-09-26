@@ -1874,6 +1874,7 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    uint32_t use_rows;
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -5977,7 +5978,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                    gdn_names[si][kda], gdn_len, gdn_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
             }
         }
@@ -13014,6 +13015,10 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     const uint32_t neq1 = (uint32_t)src_q->ne[1];
     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
 
+    // rows mode (src[6]): src[5] is the 2D state cache and seq s reads row src[6][s]
+    const bool use_rows = dst->src[6] != nullptr;
+    const vk_subbuffer rows_buf = use_rows ? ggml_vk_tensor_subbuffer(ctx, dst->src[6]) : src_buf[5];
+
     const float scale = 1.0f / sqrtf((float)S_v);
     const vk_op_gated_delta_net_push_constants pc = {
         H, n_tokens, n_seqs, s_off,
@@ -13022,11 +13027,12 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         sb1, sb2, sb3,
         neq1, rq3,
         scale,
-        K
+        K,
+        use_rows ? 1u : 0u
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, rows_buf},
         pc, { H, n_seqs, S_v });
 }
 
@@ -18812,8 +18818,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && op->src[0]->ne[0] == 64;
         case GGML_OP_GATED_DELTA_NET:
             {
-                // rows-indexed state read (src[6]) not implemented on Vulkan yet
-                if (op->src[6] != nullptr) {
+                // rows-indexed state read (src[6]): int32 row per seq
+                if (op->src[6] != nullptr && (op->src[6]->type != GGML_TYPE_I32 || !ggml_is_contiguous(op->src[6]))) {
+                    return false;
+                }
+                // raw gates (op param 1) are not implemented here
+                if (ggml_get_op_params_i32(op, 1) != 0) {
                     return false;
                 }
                 const uint32_t S_v = op->src[2]->ne[0];
