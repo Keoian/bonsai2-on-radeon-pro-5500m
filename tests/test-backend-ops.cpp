@@ -4440,6 +4440,75 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// GATED_DELTA_NET (K = 1, one sequence) followed by a CPY of its final state into a cache row: the Vulkan
+// backend fuses the write-back into the GDN kernel (GDN_STATE_CPY), including the in-place case where the
+// state is read from and written to the same row.
+struct test_gdn_state_cpy : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const bool    rows_mode;
+    const int64_t write_row;
+
+    std::string vars() override {
+        return VARS_TO_STR4(head_count, head_size, rows_mode, write_row);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_gdn_state_cpy(int64_t head_count = 4, int64_t head_size = 128, bool rows_mode = true, int64_t write_row = 1)
+        : head_count(head_count), head_size(head_size), rows_mode(rows_mode), write_row(write_row) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t D = head_size * head_size * head_count;
+        ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, 1, 1);
+        ggml_tensor * k    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, 1, 1);
+        ggml_tensor * v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, 1, 1);
+        ggml_tensor * g    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, head_count, 1, 1);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, head_count, 1, 1);
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, 4);
+        ggml_set_name(v, "v");
+        ggml_set_name(g, "g");
+        ggml_set_name(beta, "beta");
+        ggml_set_name(cache, "state");
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+
+        ggml_tensor * gdn;
+        if (rows_mode) {
+            ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+            ggml_set_name(rows, "rows");
+            gdn = ggml_gated_delta_net_rows(ctx, q, k, v, g, beta, cache, rows, 1);
+        } else {
+            ggml_tensor * s = ggml_view_4d(ctx, cache, head_size, head_size, head_count, 1,
+                head_size * sizeof(float), head_size * head_size * sizeof(float), D * sizeof(float), D * sizeof(float));
+            gdn = ggml_gated_delta_net(ctx, q, k, v, g, beta, s, 1);
+        }
+        ggml_tensor * scores = ggml_view_1d(ctx, gdn, head_size * head_count, 0);
+        ggml_tensor * state  = ggml_view_1d(ctx, gdn, D, head_size * head_count * sizeof(float));
+        ggml_tensor * dst    = ggml_view_1d(ctx, cache, D, write_row * D * sizeof(float));
+        ggml_tensor * w      = ggml_cpy(ctx, state, dst);
+        return ggml_concat(ctx, scores, w, 0);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else if (strcmp(t->name, "rows") == 0) {
+                const int32_t row = 1;
+                ggml_backend_tensor_set(t, &row, 0, sizeof(row));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -10194,6 +10263,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+    for (bool rows_mode : {true, false}) {
+        for (int64_t write_row : {1, 2}) {
+            test_cases.emplace_back(new test_gdn_state_cpy(4, 128, rows_mode, write_row));
+        }
+    }
+    test_cases.emplace_back(new test_gdn_state_cpy(48, 128, true, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
     // raw gates (sigmoid / softplus folded into the op): decode, prefill, rows mode

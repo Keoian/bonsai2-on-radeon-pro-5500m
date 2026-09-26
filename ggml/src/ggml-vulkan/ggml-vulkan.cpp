@@ -1875,6 +1875,7 @@ struct vk_op_gated_delta_net_push_constants {
     float scale;
     uint32_t K;
     uint32_t use_rows;
+    uint32_t state_out;
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -5978,7 +5979,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
+                    gdn_names[si][kda], gdn_len, gdn_data, "main", 9, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
             }
         }
@@ -10110,6 +10111,37 @@ static bool ggml_vk_can_use_fwht(const ggml_backend_vk_context * ctx, const ggml
     return true;
 }
 
+// GATED_DELTA_NET (K = 1, one sequence) ... empty ops ... CPY(view of the GDN state, cache row): the GDN kernel
+// writes the final state straight into the CPY destination instead of its own output followed by a copy.
+static bool ggml_vk_can_fuse_gdn_state_cpy(const struct ggml_cgraph * cgraph, int node_idx, int * dist) {
+    const ggml_tensor * gdn = cgraph->nodes[node_idx];
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || ggml_get_op_params_i32(gdn, 0) != 1 || gdn->src[2]->ne[3] != 1) {
+        return false;
+    }
+    int j = node_idx + 1;
+    while (j < cgraph->n_nodes && j - node_idx <= 4 && ggml_op_is_empty(cgraph->nodes[j]->op)) {
+        ++j;
+    }
+    if (j >= cgraph->n_nodes || j - node_idx > 4) {
+        return false;
+    }
+    const ggml_tensor * cpy = cgraph->nodes[j];
+    if (cpy->op != GGML_OP_CPY || cpy->type != GGML_TYPE_F32 || !ggml_is_contiguous(cpy)) {
+        return false;
+    }
+    const ggml_tensor * st = cpy->src[0];
+    const int64_t S_v = gdn->src[2]->ne[0];
+    const int64_t H   = gdn->src[2]->ne[1];
+    const int64_t T   = gdn->src[2]->ne[2];
+    if (st->view_src != gdn || st->type != GGML_TYPE_F32 || !ggml_is_contiguous(st) ||
+        st->view_offs != (size_t) (S_v * H * T) * sizeof(float) ||
+        ggml_nelements(st) != S_v * S_v * H) {
+        return false;
+    }
+    *dist = j - node_idx;
+    return true;
+}
+
 static bool ggml_vk_can_fuse_mul_fwht(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, int * mm_dist = nullptr) {
     // FADI-FUSION: pattern is MUL(x, signs) ... RESHAPE ... FWHT-hinted MUL_MAT.
     // Reshape/view ops between them are "empty" — they appear in cgraph->nodes but
@@ -12974,7 +13006,8 @@ static void ggml_vk_gated_linear_attn(ggml_backend_vk_context * ctx, vk_context&
         pc, { (uint32_t)(n_seqs * n_heads), 1, 1 });
 }
 
-static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+// state_cpy: the fused CPY (see ggml_vk_can_fuse_gdn_state_cpy) whose destination receives the final state
+static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const ggml_tensor * state_cpy = nullptr) {
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_v     = dst->src[2];
     const ggml_tensor * src_beta  = dst->src[4];
@@ -13018,6 +13051,7 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     // rows mode (src[6]): src[5] is the 2D state cache and seq s reads row src[6][s]
     const bool use_rows = dst->src[6] != nullptr;
     const vk_subbuffer rows_buf = use_rows ? ggml_vk_tensor_subbuffer(ctx, dst->src[6]) : src_buf[5];
+    const vk_subbuffer state_out_buf = state_cpy ? ggml_vk_tensor_subbuffer(ctx, state_cpy) : dst_buf;
 
     const float scale = 1.0f / sqrtf((float)S_v);
     const vk_op_gated_delta_net_push_constants pc = {
@@ -13028,11 +13062,12 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         neq1, rq3,
         scale,
         K,
-        use_rows ? 1u : 0u
+        use_rows ? 1u : 0u,
+        state_cpy ? 1u : 0u
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, rows_buf},
+        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, rows_buf, state_out_buf},
         pc, { H, n_seqs, S_v });
 }
 
@@ -16037,7 +16072,8 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
 
     case GGML_OP_GATED_DELTA_NET:
-        ggml_vk_gated_delta_net(ctx, compute_ctx, node);
+        ggml_vk_gated_delta_net(ctx, compute_ctx, node,
+            ctx->num_additional_fused_ops > 0 ? cgraph->nodes[node_idx + ctx->num_additional_fused_ops] : nullptr);
 
         break;
 
@@ -17488,9 +17524,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_scale = false;
         const char *fusion_string {};
         int mm_fwht_dist = 0;
+        int gdn_cpy_dist = 0;
+        bool gdn_state_cpy = false;
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
-            if (num_adds) {
+            if (ggml_vk_can_fuse_gdn_state_cpy(cgraph, i, &gdn_cpy_dist)) {
+                ctx->num_additional_fused_ops = gdn_cpy_dist;
+                fusion_string = "GDN_STATE_CPY";
+                gdn_state_cpy = true;
+                // the GDN output (attention scores) is still read by later nodes
+                ctx->fused_ops_write_mask |= 1;
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
@@ -17645,8 +17690,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_ops_write_mask |= 1 << ctx->num_additional_fused_ops;
 
         // Check whether fusion would overwrite src operands while they're still in use.
-        // If so, disable fusion.
-        if (ctx->num_additional_fused_ops) {
+        // If so, disable fusion. GDN_STATE_CPY overlaps its state source by design (see its matcher).
+        if (ctx->num_additional_fused_ops && !gdn_state_cpy) {
             // There are up to two output nodes - topk_moe has two.
             uint32_t bits = ctx->fused_ops_write_mask & ~(1 << ctx->num_additional_fused_ops);
             ggml_tensor *output_nodes[2] {};
