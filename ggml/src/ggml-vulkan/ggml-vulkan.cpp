@@ -3784,6 +3784,15 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 
     result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
 
+    // AMD RDNA with head size >= 256: 16 rows per workgroup spills registers in the scalar path (8 is ~3x
+    // faster for prefill), and a wider d_split speeds up few-row decode (Radeon Pro 5500M, hsk = hsv = 256)
+    if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN && hsk >= 256 && hsv >= 256) {
+        result.block_rows = std::min(result.block_rows, 8u);
+        if (n_rows <= 8) {
+            result.d_split = std::min(std::min(result.subgroup_size, 16u), D_lsb / 4);
+        }
+    }
+
     if (!reduce_block_rows && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
         result.block_rows /= 2;
     }
