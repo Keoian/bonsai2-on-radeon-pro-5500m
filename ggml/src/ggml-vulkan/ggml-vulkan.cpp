@@ -4223,6 +4223,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                             l_mmq_wg_denoms, m_mmq_wg_denoms, s_mmq_wg_denoms,
                             l_mmq_wg_denoms_k, m_mmq_wg_denoms_k, s_mmq_wg_denoms_k,
                             l_mmqid_wg_denoms, m_mmqid_wg_denoms, s_mmqid_wg_denoms;
+    // PTQ1_0 float mat-mat tiles (default: the regular quant tiles)
+    std::vector<uint32_t> l_warptile_mmq_ptq1, m_warptile_mmq_ptq1, s_warptile_mmq_ptq1;
+    std::array<uint32_t, 3> l_mmq_wg_denoms_ptq1, m_mmq_wg_denoms_ptq1, s_mmq_wg_denoms_ptq1;
 
     uint32_t l_align, m_align, s_align;
 
@@ -4582,6 +4585,18 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 #endif
 
+    l_warptile_mmq_ptq1 = l_warptile_mmq; m_warptile_mmq_ptq1 = m_warptile_mmq; s_warptile_mmq_ptq1 = s_warptile_mmq;
+    l_mmq_wg_denoms_ptq1 = l_mmq_wg_denoms; m_mmq_wg_denoms_ptq1 = m_mmq_wg_denoms; s_mmq_wg_denoms_ptq1 = s_mmq_wg_denoms;
+    if (device->architecture == AMD_RDNA1 && !device->coopmat_support && !device->coopmat2) {
+        // RDNA1 without matrix cores (the regular large tile is disabled on AMD): a 64x128 tile with TN = 4 is ~10%
+        // faster than the 64x64 medium tile for PTQ1_0 prefill ubatches; ggml_vk_guess_matmul_pipeline picks it when
+        // its column padding is small (Radeon Pro 5500M)
+        const uint32_t sg8 = std::max(device->subgroup_size, 8u);
+        l_warptile_mmq_ptq1 = { 128, 64, 128, 32, sg8, 64, 2, 4, 4, 1, sg8 };
+        l_mmq_wg_denoms_ptq1 = { 64, 128, 1 };
+        device->mul_mat_l[GGML_TYPE_PTQ1_0] = true;
+    }
+
 #if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
     if (device->coopmat2) {
         for (auto &fa : device->pipeline_flash_attn_f32_f16) {
@@ -4922,7 +4937,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM_NODOT2(GGML_TYPE_BF16, pipeline_matmul_bf16, matmul_bf16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
 
         CREATE_MM2(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q1_0], matmul_q1_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
-        CREATE_MM2(GGML_TYPE_PTQ1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_PTQ1_0], matmul_ptq1_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+        CREATE_MM2(GGML_TYPE_PTQ1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_PTQ1_0], matmul_ptq1_0_f32, mmq_wg_denoms_ptq1, warptile_mmq_ptq1, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_PQ2_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_PQ2_0], matmul_pq2_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_0], matmul_q2_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0], matmul_q4_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
@@ -8942,7 +8957,11 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     if ((mm_s && (m <= 32 || n <= 32)) || (!mm_m && !mm_l)) {
         return aligned ? mmp->a_s : mmp->s;
     }
-    if ((mm_m && (m <= 64 || n <= 64)) || !mm_l) {
+    // RDNA1 PTQ1_0: the large pipeline is a 64x128 tile, ~10% faster per column than the 64x64 medium tile; use it
+    // unless its column padding costs more than that (e.g. n = 296 -> 384 vs 320 columns)
+    const bool ptq1_wide = ctx->device->architecture == AMD_RDNA1 && src0_type == GGML_TYPE_PTQ1_0 && !is_q8_1;
+    const bool ptq1_pad  = ptq1_wide && CEIL_DIV(n, 128) * 128 * 10 > CEIL_DIV(n, 64) * 64 * 11;
+    if ((mm_m && (m <= 64 || n <= 64 || ptq1_pad)) || !mm_l) {
         return aligned ? mmp->a_m : mmp->m;
     }
     return aligned ? mmp->a_l : mmp->l;
