@@ -55,7 +55,8 @@ Stock llama.cpp cannot run these files. Bonsai 2 needs the fork's Hadamard activ
 ## Run
 
 ```
-.\bonsai2-5500m\start-server.ps1               # PTQ1_0 on Vulkan, 32k context
+.\bonsai2-5500m\start-server.ps1               # PTQ1_0 on Vulkan, 16k context
+.\bonsai2-5500m\start-server.ps1 -Ctx 32768    # 32k: only when other apps aren't holding VRAM (see below)
 .\bonsai2-5500m\start-server.ps1 -Lan          # listen on 0.0.0.0 for other machines on the LAN
 .\bonsai2-5500m\start-server.ps1 -Cpu          # CPU-only fallback (uses PQ2_0)
 .\bonsai2-5500m\start-server.ps1 --reasoning-budget 2048    # unknown flags pass straight to llama-server
@@ -66,10 +67,18 @@ Then open http://localhost:8080. The launcher's defaults exist to fit in 8 GB of
 - `-np 1`: every server slot allocates its own recurrent-state cache, and the default of 4 runs out of memory.
 - `--no-mmproj-offload`: the 0.63 GB vision projector stays in system RAM. Text speed is unaffected and
   image encoding is slower. `-MmprojGpu` puts it back on the GPU if you have room.
-- 32k context with a mixed KV cache: 8-bit keys and 4-bit values (`-CacheK q8_0 -CacheV q4_0`).
+- 16k context with a mixed KV cache: 8-bit keys and 4-bit values (`-CacheK q8_0 -CacheV q4_0`).
   Keys are the half that loses accuracy when compressed, so they keep 8 bits.
 
-KV cache options measured on this card (same short prompt, fresh server each time):
+**VRAM caveat.** Under Boot Camp the 5500M is the only GPU Windows sees, so it also drives the display. The
+desktop compositor and any GPU-accelerated apps (browsers, VS Code, Steam, Remote Desktop) hold VRAM too:
+1.0 to 1.4 GB was typical in testing. 32k with the default cache needs about 6.9 GB for llama.cpp, so it only
+fits when little else is using the GPU. Otherwise the KV cache allocation fails (`ErrorOutOfDeviceMemory`), or
+the server starts with part of its working memory spilled to system RAM and decodes at about 6.5 tok/s. Close
+or disable GPU acceleration in those apps before using `-Ctx 32768`. The table below was measured on a mostly
+idle desktop.
+
+KV cache options measured on this card (same short prompt, fresh server each time, mostly idle desktop):
 
 | Keys / values | Context | Fits? | Decode |
 |---|---|---|---|
@@ -77,7 +86,7 @@ KV cache options measured on this card (same short prompt, fresh server each tim
 | f16 / f16 | 20k, 24k | out of memory | |
 | q8_0 / q8_0 | 16k | yes | 14.1 tok/s |
 | q8_0 / q8_0 | 32k | yes, but VRAM is nearly full | 9.1 tok/s |
-| **q8_0 / q4_0 (default)** | **32k** | **yes** | **14.2 tok/s** |
+| **q8_0 / q4_0 (default cache)** | **32k** | **yes, if little else uses VRAM** | **14.2 tok/s** |
 | q4_0 / q4_0 | 32k | yes | 14.2 tok/s |
 
 Quality cost of the default cache, measured as WikiText-2 perplexity (lower is better, same text for both):
