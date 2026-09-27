@@ -9366,6 +9366,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // PTQ1_0 mat-mat (n > mul_mat_vec_max_cols): Bonsai-2 k, odd m, batched A
+    for (int64_t k : {5120, 17408}) {
+        for (int64_t n : {9, 64, 512}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 67, n, k, {1, 1}, {1, 1}));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 256, 128, 5120, {2, 1}, {1, 1}));
     // PTQ1_0 / PQ2_0 integer-dot mat-vec: Bonsai-2 shapes, odd row counts (row tail), batches and multi-column B
     for (int64_t n : {1, 2, 3, 4, 5, 8}) {
         for (int64_t k : {1024, 5120, 6144, 17408}) {
