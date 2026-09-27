@@ -9640,7 +9640,13 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
         }
     case VK_VENDOR_ID_INTEL:
         if (device->architecture == vk_device_architecture::INTEL_XE2) {
-            if (src0_type == GGML_TYPE_Q2_0 || src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_Q6_K) {
+            // PTQ1_0 is listed here because it has a dedicated integer-dot mat-vec shader
+            // (mul_mat_vecq_ptq1_0.comp); without it the blanket Intel-Windows opt-out below
+            // keeps PTQ1_0 on the dequant path. Measured on Arc B390 (Bonsai 2 27B, tg128):
+            // 1.62 -> 13.16 t/s. PQ2_0 is deliberately NOT listed - measured 11.56 -> 11.63 t/s,
+            // i.e. no gain over its dequant mat-vec, so it stays on the existing path.
+            if (src0_type == GGML_TYPE_Q2_0 || src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_Q6_K ||
+                src0_type == GGML_TYPE_PTQ1_0) {
                 return true;
             }
         }
@@ -18898,7 +18904,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (op->src[6] != nullptr && (op->src[6]->type != GGML_TYPE_I32 || !ggml_is_contiguous(op->src[6]))) {
                     return false;
                 }
-                // raw gates (op param 1) are not implemented here
+                // raw gates (ggml_gated_delta_net_set_raw_gates): beta and g arrive
+                // pre-activation and need beta = sigmoid(beta) and
+                // g = a * softplus(g + dt_bias), with dt_bias in src[7] and a in src[8].
+                // gated_delta_net.comp has neither those bindings nor that math - it
+                // applies exp(g) unconditionally - so the shader silently returns wrong
+                // results for this case. Decline it and let it fall back to the CPU.
                 if (ggml_get_op_params_i32(op, 1) != 0) {
                     return false;
                 }
