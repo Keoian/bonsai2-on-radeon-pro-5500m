@@ -5825,7 +5825,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         int idx = 0;
         const uint32_t sg = std::max(device->subgroup_size, 1u);
         for (uint32_t n : {64, 128, 256, 512, 1024, 2048, 4096, 8192}) {
-            const bool wide = n > GGML_VK_FWHT_MAX_SUBGROUP_N || n / sg > GGML_VK_FWHT_MAX_SUBGROUP_EL_W;
+            // AMD: from n = 1024 the one-subgroup-per-row variant serializes too much for the few rows of decode
+            // (Radeon Pro 5500M: 21 us -> 7.7 us per 1024-wide transform with the shared-memory variant)
+            const uint32_t max_subgroup_n = device->vendor_id == VK_VENDOR_ID_AMD ? 512u : GGML_VK_FWHT_MAX_SUBGROUP_N;
+            const bool wide = n > max_subgroup_n || n / sg > GGML_VK_FWHT_MAX_SUBGROUP_EL_W;
             if (use_subgroup && !wide) {
                 if (device->subgroup_size <= n) {
                     ggml_vk_create_pipeline(device, device->pipeline_fwht_f32[idx], "fwht_f32", fwht_f32_len, fwht_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
