@@ -1,0 +1,369 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 184af222e..39c350db1 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1056,6 +1056,9 @@ struct vk_device_struct {
+     vk_pipeline pipeline_fwht_f16[GGML_VK_FWHT_NUM_SIZES];
+     // FADI-FUSION: dedicated signed variants (3 descriptors, signs buffer bound)
+     vk_pipeline pipeline_fwht_signed_f32[GGML_VK_FWHT_NUM_SIZES];
++    // shared-memory FWHT that also writes the q8_1_x4 copy of its output (see fwht.comp FWHT_Q8)
++    vk_pipeline pipeline_fwht_q8_f32[GGML_VK_FWHT_NUM_SIZES];
++    vk_pipeline pipeline_fwht_signed_q8_f32[GGML_VK_FWHT_NUM_SIZES];
+     vk_pipeline pipeline_fwht_signed_f16[GGML_VK_FWHT_NUM_SIZES];
+     // rows a workgroup covers, chosen per width when the pipeline is built
+     uint32_t fwht_rows_per_wg[GGML_VK_FWHT_NUM_SIZES] = {};
+@@ -1876,6 +1879,7 @@ struct vk_op_gated_delta_net_push_constants {
+     uint32_t K;
+     uint32_t use_rows;
+     uint32_t state_out;
++    uint32_t raw_gates;
+ };
+ 
+ struct vk_op_ssm_scan_push_constants {
+@@ -5879,6 +5883,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+                     }
+                     // FADI-FUSION: signed twins for the MUL(signs)+FWHT fusion
+                     ggml_vk_create_pipeline(device, device->pipeline_fwht_signed_f32[idx], "fwht_signed_shmem_f32", fwht_signed_shmem_f32_len, fwht_signed_shmem_f32_data, "main", 3, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n, rows }, 1);
++                    // q8_1 twins: 32-lane clusters must hold whole blocks (one row per workgroup, >= 32 threads per row)
++                    if (rows == 1 && block_size >= 32 && n % 128 == 0 && device->subgroup_clustered && device->subgroup_size >= 32) {
++                        ggml_vk_create_pipeline(device, device->pipeline_fwht_q8_f32[idx], "fwht_shmem_q8_f32", fwht_shmem_q8_f32_len, fwht_shmem_q8_f32_data, "main", 4, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n, rows }, 1);
++                        ggml_vk_create_pipeline(device, device->pipeline_fwht_signed_q8_f32[idx], "fwht_signed_shmem_q8_f32", fwht_signed_shmem_q8_f32_len, fwht_signed_shmem_q8_f32_data, "main", 4, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n, rows }, 1);
++                    }
+                     if (device->fp16) {
+                         ggml_vk_create_pipeline(device, device->pipeline_fwht_signed_f16[idx], "fwht_signed_shmem_f16", fwht_signed_shmem_f16_len, fwht_signed_shmem_f16_data, "main", 3, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n, rows }, 1);
+                     }
+@@ -6006,7 +6015,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ 
+             for (uint32_t kda = 0; kda < 2; kda++) {
+                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
+-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 9, sizeof(vk_op_gated_delta_net_push_constants),
++                    gdn_names[si][kda], gdn_len, gdn_data, "main", 11, sizeof(vk_op_gated_delta_net_push_constants),
+                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
+             }
+         }
+@@ -9826,8 +9835,13 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+         }
+     }
+     if (quantize_y) {
++        // the q8_1 copy may also come from the FWHT that produced src1 (src1 is then a view of that tensor's data)
++        const ggml_tensor * last = ctx->prealloc_y_last_tensor_used;
++        const bool same_data = last == src1 ||
++            (last != nullptr && last->data == src1->data && last->buffer == src1->buffer &&
++             ggml_nbytes(last) == ggml_nbytes(src1) && ggml_is_contiguous(last) && ggml_is_contiguous(src1));
+         if (ctx->prealloc_y_last_pipeline_used != to_q8_1.get() ||
+-            ctx->prealloc_y_last_tensor_used != src1 ||
++            !same_data ||
+             ctx->prealloc_y_last_decode_vector_staging) {
+             if (ctx->prealloc_y_need_sync) {
+                 ggml_vk_sync_buffers(ctx, subctx);
+@@ -10280,6 +10294,33 @@ static void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, cons
+     };
+     init_pushconst_tensor_offsets(ctx, pc, src, nullptr, nullptr, nullptr, dst);
+ 
++    // Decode-sized transforms (<= 8 tokens of the widest activation): also write the q8_1_x4 copy into prealloc_y,
++    // where the consuming q8_1 mat-vec looks for its quantized input (see the prealloc_y_last_* dedupe)
++    vk_pipeline pipeline_q8 = nullptr;
++    if (src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ctx->device->integer_dot_product &&
++        ggml_nelements(dst) <= 8 * 17408) {
++        pipeline_q8 = signs != nullptr ? ctx->device->pipeline_fwht_signed_q8_f32[idx] : ctx->device->pipeline_fwht_q8_f32[idx];
++    }
++    if (pipeline_q8 != nullptr) {
++        const uint64_t q8_sz = CEIL_DIV((uint64_t) ggml_nelements(dst), 128) * 144;
++        if (ctx->prealloc_size_y < q8_sz) {
++            ctx->prealloc_size_y = q8_sz;
++            ggml_vk_preallocate_buffers(ctx, subctx);
++        }
++        ggml_pipeline_request_descriptor_sets(ctx, pipeline_q8, 1);
++        if (ctx->prealloc_y_need_sync) {
++            ggml_vk_sync_buffers(ctx, subctx);
++        }
++        const vk_subbuffer q8_buf = { ctx->prealloc_y, 0, q8_sz };
++        const vk_subbuffer signs_buf = signs != nullptr ? ggml_vk_tensor_subbuffer(ctx, signs, true) : src_buf;
++        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_q8, { src_buf, dst_buf, signs_buf, q8_buf }, pc, { workgroups_x, 1, 1 });
++        ggml_vk_sync_buffers(ctx, subctx);
++        ctx->prealloc_y_last_pipeline_used = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1).get();
++        ctx->prealloc_y_last_tensor_used = dst;
++        ctx->prealloc_y_last_decode_vector_staging = false;
++        return;
++    }
++
+     if (signs != nullptr) {
+         const vk_subbuffer signs_buf = ggml_vk_tensor_subbuffer(ctx, signs, true);
+         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf, signs_buf }, pc, { workgroups_x, 1, 1 });
+@@ -13083,6 +13124,10 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
+     const bool use_rows = dst->src[6] != nullptr;
+     const vk_subbuffer rows_buf = use_rows ? ggml_vk_tensor_subbuffer(ctx, dst->src[6]) : src_buf[5];
+     const vk_subbuffer state_out_buf = state_cpy ? ggml_vk_tensor_subbuffer(ctx, state_cpy) : dst_buf;
++    // raw gates (op param 1): dt_bias (src[7]) and a (src[8]) per head
++    const bool raw_gates = ggml_get_op_params_i32(dst, 1) != 0;
++    const vk_subbuffer dt_bias_buf = raw_gates ? ggml_vk_tensor_subbuffer(ctx, dst->src[7]) : src_buf[4];
++    const vk_subbuffer a_buf       = raw_gates ? ggml_vk_tensor_subbuffer(ctx, dst->src[8]) : src_buf[4];
+ 
+     const float scale = 1.0f / sqrtf((float)S_v);
+     const vk_op_gated_delta_net_push_constants pc = {
+@@ -13094,11 +13139,12 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
+         scale,
+         K,
+         use_rows ? 1u : 0u,
+-        state_cpy ? 1u : 0u
++        state_cpy ? 1u : 0u,
++        raw_gates ? 1u : 0u
+     };
+ 
+     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, rows_buf, state_out_buf},
++        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, rows_buf, state_out_buf, dt_bias_buf, a_buf},
+         pc, { H, n_seqs, S_v });
+ }
+ 
+@@ -18898,8 +18944,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                 if (op->src[6] != nullptr && (op->src[6]->type != GGML_TYPE_I32 || !ggml_is_contiguous(op->src[6]))) {
+                     return false;
+                 }
+-                // raw gates (op param 1) are not implemented here
+-                if (ggml_get_op_params_i32(op, 1) != 0) {
++                // raw gates (op param 1): scalar gate only, f32 dt_bias / a per head
++                if (ggml_get_op_params_i32(op, 1) != 0 &&
++                    (op->src[3]->ne[0] != 1 || !op->src[7] || !op->src[8] ||
++                     op->src[7]->type != GGML_TYPE_F32 || op->src[8]->type != GGML_TYPE_F32 ||
++                     !ggml_is_contiguous(op->src[7]) || !ggml_is_contiguous(op->src[8]))) {
+                     return false;
+                 }
+                 const uint32_t S_v = op->src[2]->ne[0];
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/fwht.comp b/ggml/src/ggml-vulkan/vulkan-shaders/fwht.comp
+index 7bf455f12..a62f960ed 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/fwht.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/fwht.comp
+@@ -8,6 +8,14 @@
+ #extension GL_KHR_shader_subgroup_basic : enable
+ #extension GL_KHR_shader_subgroup_shuffle : enable
+ #endif
++#ifdef FWHT_Q8
++#extension GL_KHR_shader_subgroup_basic : enable
++#extension GL_KHR_shader_subgroup_clustered : enable
++#extension GL_EXT_shader_8bit_storage : require
++#extension GL_EXT_shader_16bit_storage : require
++#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
++#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
++#endif
+ 
+ layout(constant_id = 0) const uint BLOCK_SIZE = 32;
+ layout(constant_id = 1) const uint N = 128;
+@@ -36,6 +44,13 @@ layout(binding = 1, std430) writeonly buffer D { float data_d[]; };
+ #ifdef FWHT_SIGNED
+ layout(binding = 2, std430) readonly buffer S { float data_s[]; };
+ #endif
++// FWHT_Q8 (shared-memory variant, BLOCK_SIZE >= 32): also write the result quantized as block_q8_1_x4 (144 bytes per
++// 128 elements: 4 x f16vec2 ds, then 128 int8), the input format of the q8_1 mat-vec, so the matmul that consumes this
++// transform skips its separate quantize dispatch. Same math as quantize_q8_1.comp (bit-identical blocks).
++#ifdef FWHT_Q8
++layout(binding = 3, std430) writeonly buffer Q8B { int8_t data_q8[]; };
++layout(binding = 3, std430) writeonly buffer Q8H { float16_t data_q8h[]; };
++#endif
+ 
+ const uint EL_W = N / BLOCK_SIZE;
+ 
+@@ -132,6 +147,30 @@ void main() {
+             }
+ #ifdef FWHT_SHMEM
+         }
++#endif
++#ifdef FWHT_Q8
++        // one row per workgroup here, so the row is uniform and all lanes take part in the clustered ops;
++        // element i * BLOCK_SIZE + tid: a 32-lane cluster holds one 32-element q8_1 block
++        [[unroll]]
++        for (uint i = 0; i < EL_W; ++i) {
++            const float v    = reg[i];
++            const float amax = subgroupClusteredMax(abs(v), 32);
++            const float d    = amax / 127.0;
++            const float dinv = d != 0.0 ? 1.0 / d : 0.0;
++            const float q    = round(v * dinv);
++            const float sum  = subgroupClusteredAdd(q, 32);
++            const uint  e    = row_offset + i * BLOCK_SIZE + tid;
++            if (row < n_rows) {
++                data_q8[(e / 128) * 144 + 16 + (e % 128)] = int8_t(q);
++                if ((tid % 32) == 0) {
++                    const uint h = (e / 128) * 72 + ((e % 128) / 32) * 2;
++                    data_q8h[h]     = float16_t(d);
++                    data_q8h[h + 1] = float16_t(sum * d);
++                }
++            }
++        }
++#endif
++#ifdef FWHT_SHMEM
+         barrier();
+ #endif
+     }
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp b/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
+index 82f26e1ac..624634e0d 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
+@@ -34,6 +34,7 @@ layout(push_constant) uniform Parameters {
+     uint K;
+     uint use_rows;
+     uint state_out; // 1: the final state goes to StateOutBuf (fused state write-back), not to dst
++    uint raw_gates; // 1: beta and g are pre-activation: beta = sigmoid(beta), g = a[h] * softplus(g + dt_bias[h])
+ };
+ 
+ layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
+@@ -48,6 +49,8 @@ layout(binding = 7) readonly  buffer RowsBuf  { int data_rows[];         };
+ // fused write-back: the cache row that receives the new state (may be the row the state was read from; every
+ // invocation reads its own elements before it writes the same elements, so aliasing is safe for one sequence)
+ layout(binding = 8)           buffer StateOutBuf { FLOAT_TYPE data_state_out[]; };
++layout(binding = 9)  readonly buffer DtBiasBuf { FLOAT_TYPE data_dt_bias[]; };
++layout(binding = 10) readonly buffer ABuf      { FLOAT_TYPE data_a[];       };
+ 
+ #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
+ shared FLOAT_TYPE temp[SUBGROUP_SIZE];
+@@ -131,7 +134,10 @@ void main() {
+         const uint k_off = q_off;
+         const uint v_off = seq_id * sv3 + t * sv2 + head_id * sv1;
+         const uint gb_off = seq_id * sb3 + t * sb2 + head_id * sb1;
+-        const FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
++        FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
++        if (raw_gates != 0u) {
++            beta_val = FLOAT_TYPE(1.0) / (FLOAT_TYPE(1.0) + exp(-beta_val));
++        }
+ 
+         FLOAT_TYPE k_reg[ROWS_PER_LANE];
+         FLOAT_TYPE q_reg[ROWS_PER_LANE];
+@@ -143,7 +149,12 @@ void main() {
+ 
+         FLOAT_TYPE g_exp[ROWS_PER_LANE];
+         if (KDA == 0) {
+-            const FLOAT_TYPE g_val = exp(FLOAT_TYPE(data_g[gb_off]));
++            FLOAT_TYPE g_log = FLOAT_TYPE(data_g[gb_off]);
++            if (raw_gates != 0u) {
++                const FLOAT_TYPE x = g_log + FLOAT_TYPE(data_dt_bias[head_id]);
++                g_log = FLOAT_TYPE(data_a[head_id]) * (x > FLOAT_TYPE(20.0) ? x : log(FLOAT_TYPE(1.0) + exp(x)));
++            }
++            const FLOAT_TYPE g_val = exp(g_log);
+             [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                 g_exp[r] = g_val;
+             }
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 85544570a..b8faa59c3 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -1046,6 +1046,9 @@ void process_shaders() {
+     string_to_spv("fwht_signed_shmem_f32", "fwht.comp", {{"FWHT_SIGNED", "1"}, {"FWHT_SHMEM", "1"}});
+     string_to_spv("fwht_signed_f16", "fwht.comp", {{"FWHT_SIGNED", "1"}, {"FWHT_F16", "1"}});
+     string_to_spv("fwht_signed_shmem_f16", "fwht.comp", {{"FWHT_SIGNED", "1"}, {"FWHT_F16", "1"}, {"FWHT_SHMEM", "1"}});
++    // shared-memory variants that also write the q8_1_x4 copy of the result (decode: the consumer mat-vec skips its quantize)
++    string_to_spv("fwht_shmem_q8_f32", "fwht.comp", {{"FWHT_SHMEM", "1"}, {"FWHT_Q8", "1"}});
++    string_to_spv("fwht_signed_shmem_q8_f32", "fwht.comp", {{"FWHT_SIGNED", "1"}, {"FWHT_SHMEM", "1"}, {"FWHT_Q8", "1"}});
+     string_to_spv("count_equal_i32", "count_equal.comp", merge_maps(base_dict, {{"A_TYPE", "int"}, {"B_TYPE", "int"}, {"D_TYPE", "int"}}));
+     string_to_spv("cumsum_f32", "cumsum.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+     string_to_spv("cumsum_multipass1_f32", "cumsum_multipass1.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 07ec8edc2..5274df540 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -159,7 +159,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
+         if (is_gpu && strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "Vulkan") != 0) {
+             gdn_state_rows_dev_ok = false;
+         }
+-        if (strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "CUDA") != 0 &&
++        if (strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "CUDA") != 0 && strcmp(reg_name, "Vulkan") != 0 &&
+             strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0 && strcmp(reg_name, "CPU") != 0) {
+             gdn_raw_gates_dev_ok = false;
+         }
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f4c0b09b3..3a816ca87 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4755,6 +4755,81 @@ struct test_mul_mat_hadamard : public test_mul_mat {
+     }
+ };
+ 
++// (optional sign flip) + FWHT-hint matmul feeding a PTQ1_0 mat-vec: on Vulkan the FWHT writes the q8_1 copy that the
++// mat-vec consumes instead of quantizing its input again
++struct test_fwht_ptq1_mv : public test_case {
++    const int64_t width;
++    const int64_t n_tokens;
++    const bool    signs;
++
++    test_fwht_ptq1_mv(int64_t width = 5120, int64_t n_tokens = 1, bool signs = true)
++        : width(width), n_tokens(n_tokens), signs(signs) {}
++
++    std::string vars() override {
++        return VARS_TO_STR3(width, n_tokens, signs);
++    }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "FWHT_PTQ1_MV";
++    }
++
++    // same tolerance as test_mul_mat: the mat-vec quantizes its activations to q8_1
++    double max_nmse_err() override {
++        return 5e-4;
++    }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        const int64_t blk = 1024;
++        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, blk, blk);
++        ggml_set_name(a, "a");
++        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, n_tokens);
++        ggml_set_name(x, "x");
++        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_PTQ1_0, width, 67);
++        ggml_set_name(w, "w");
++
++        ggml_tensor * cur = x;
++        if (signs) {
++            ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
++            ggml_set_name(s, "s");
++            cur = ggml_mul(ctx, cur, s);
++        }
++        cur = ggml_reshape_2d(ctx, cur, blk, width / blk * n_tokens);
++        cur = ggml_mul_mat(ctx, a, cur);
++        ggml_mul_mat_set_hint(cur, GGML_HINT_SRC0_IS_HADAMARD);
++        cur = ggml_reshape_2d(ctx, cur, width, n_tokens);
++        ggml_tensor * out = ggml_mul_mat(ctx, w, cur);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (strcmp(t->name, "a") == 0) {
++                const int64_t n = t->ne[0];
++                std::vector<float> data(n * n);
++                const float scale = 1.0f / sqrtf((float) n);
++                for (int64_t r = 0; r < n; r++) {
++                    for (int64_t i = 0; i < n; i++) {
++                        int64_t v = r & i; int pop = 0;
++                        while (v) { pop += (int) (v & 1); v >>= 1; }
++                        data[r * n + i] = (pop % 2 == 0) ? scale : -scale;
++                    }
++                }
++                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
++            } else if (strcmp(t->name, "s") == 0) {
++                std::vector<float> data(ggml_nelements(t));
++                for (size_t i = 0; i < data.size(); i++) {
++                    data[i] = (i % 3 == 0) ? -1.0f : 1.0f;
++                }
++                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
++            } else {
++                init_tensor_uniform(t);
++            }
++        }
++    }
++};
++
+ // sign flip + reshape + FWHT-hint matmul, the fusable Hadamard activation path
+ struct test_fwht_signed : public test_case {
+     const int64_t blk;
+@@ -9324,6 +9399,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 128, 32, 128));
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 2048, 1, 2048));
+     test_cases.emplace_back(new test_fwht_signed(1024, 5120, 1));
++    for (int64_t width : {5120, 6144, 17408}) {
++        for (int64_t nt : {1, 2, 4}) {
++            test_cases.emplace_back(new test_fwht_ptq1_mv(width, nt, true));
++        }
++        test_cases.emplace_back(new test_fwht_ptq1_mv(width, 1, false));
++    }
+     test_cases.emplace_back(new test_fwht_signed(1024, 5120, 32));
+     test_cases.emplace_back(new test_fwht_signed(1024, 6144, 7, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_fwht_signed(1024, 17408, 3));

@@ -1,0 +1,29 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index b28ff64ec..25a04d337 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -4337,6 +4337,15 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         l_mmq_wg_denoms = l_wg_denoms = {128, 128, 1 };
+         m_mmq_wg_denoms = m_wg_denoms = { 64,  64, 1 };
+         s_mmq_wg_denoms = s_wg_denoms = { 32,  32, 1 };
++        { // SWEEP (temporary): GGML_VK_WT_L / GGML_VK_WT_M = 11 comma-separated warptile values (float and mmq tiles)
++            auto ov = [](const char * name, std::vector<uint32_t> & wt, std::array<uint32_t, 3> & den) {
++                if (const char * e = getenv(name)) { wt.clear(); std::string str(e); size_t pos = 0;
++                    while (pos <= str.size()) { size_t c = str.find(',', pos); if (c == std::string::npos) c = str.size();
++                        wt.push_back((uint32_t) std::stoul(str.substr(pos, c - pos))); pos = c + 1; }
++                    den = { wt[1], wt[2], 1 }; }
++            };
++            ov("GGML_VK_WT_L", l_warptile_mmq, l_mmq_wg_denoms); ov("GGML_VK_WT_M", m_warptile_mmq, m_mmq_wg_denoms);
++        }
+         l_align = 128;
+         m_align =  64;
+         s_align =  32;
+@@ -7068,7 +7077,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
+             switch (device->vendor_id) {
+ #ifndef GGML_VULKAN_RUN_TESTS
+             case VK_VENDOR_ID_AMD:
+-                device->mul_mat_l[i]    = device->coopmat_support && device->driver_id != vk::DriverId::eAmdProprietary;
++                device->mul_mat_l[i]    = (device->coopmat_support && device->driver_id != vk::DriverId::eAmdProprietary) || getenv("GGML_VK_MM_L") != nullptr;
+                 device->mul_mat_m[i]    = true;
+                 device->mul_mat_s[i]    = true;
+                 device->mul_mat_id_l[i] = false;
