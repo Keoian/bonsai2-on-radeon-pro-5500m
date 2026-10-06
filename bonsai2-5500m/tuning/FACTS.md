@@ -6,7 +6,7 @@ i9-9980HK, on AC power. **The 5500M is the only GPU Windows sees and it drives t
 the desktop and open apps (dwm, Chrome, VS Code, Steam) hold 1.0-1.35 GB of VRAM at idle. I did not
 close any of the user's apps; every number below is with that background load (recorded per run).
 
-## 1. GPU identity (vulkaninfo, full dump in `vulkaninfo.txt`)
+## 1. GPU identity (vulkaninfo, full dump in `logs/vulkaninfo.txt`)
 | property | value |
 |---|---|
 | device | AMD Radeon Pro 5500M (Navi 14, RDNA1), deviceID 0x7340 |
@@ -67,7 +67,7 @@ overhead; plus a lazily grown f16 K/V scratch for prefill at depth (4 KB per cac
 not fit with >= 400 MB headroom on this desktop; llama-bench at 32K fails outright, llama-server at 32K
 starts but ~600 MB of the process sits in shared (system) memory.
 
-## 5. Per-kernel time for one decode token (`GGML_VK_PERF_LOGGER`, depth ~256; logs `perflog-start.txt`)
+## 5. Per-kernel time for one decode token (`GGML_VK_PERF_LOGGER`, depth ~256; logs `logs/perflog-start.txt`)
 Start build: **112.8 ms** GPU time per token, **~2037 dispatches** (ops + fused ops) per token.
 | op | count/token | us each | ms/token |
 |---|---|---|---|
