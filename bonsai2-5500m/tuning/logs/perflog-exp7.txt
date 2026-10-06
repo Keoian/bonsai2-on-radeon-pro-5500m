@@ -1,0 +1,177 @@
+﻿.\build\bin\llama-bench.exe : ggml_vulkan: Found 1 Vulkan devices:
+At line:1 char:354
++ ... EQUENCY=16; .\build\bin\llama-bench.exe -m ..\models\Ternary-Bonsai-2 ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ggml_vulkan: Found 1 Vulkan devices::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+ggml_vulkan: 0 = AMD Radeon Pro 5500M (AMD proprietary driver) | uma: 0 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 32 | 
+shared memory: 32768 | int dot: 1 | matrix cores: none
+load_backend: loaded Vulkan backend from C:\git\bonsai2\llama.cpp\build\bin\ggml-vulkan.dll
+load_backend: loaded CPU backend from C:\git\bonsai2\llama.cpp\build\bin\ggml-cpu-haswell.dll
+----------------
+| model                          |       size |     params | backend    | ngl | type_k | type_v |  fa |            test |                  t/s |
+Vulkan Timings:
+| ------------------------------ | ---------: | ---------: | ---------- | --: | -----: | -----: | --: | --------------: | -------------------: |
+ADD: 1536 x 6.89 us = 10584.2 us
+CONCAT: 768 x 10.938 us = 8400.44 us
+CONT: 1024 x 5.907 us = 6048.92 us
+CPY: 768 x 7.149 us = 5490.56 us
+FLASH_ATTN_EXT dst(256,24,1,1),  q(256,1,24,1),  k(256,256,4,1),  v(256,256,4,1),  m(256,1,1,1): 256 x 213.498 us = 
+54655.5 us (29.4684 GFLOPS/s)
+GDN_STATE_CPY GATED_DELTA_NET: 768 x 51.301 us = 39399.4 us
+GET_ROWS: 784 x 7.611 us = 5967.16 us
+GLU: 1792 x 6.291 us = 11273.7 us
+L2_NORM: 768 x 7.175 us = 5510.84 us
+MUL: 1792 x 6.355 us = 11388.5 us
+MUL_FWHT MUL: 3360 x 8.216 us = 27608.6 us
+MUL_MAT f32 m=256 n=24 k=256: 256 x 9.436 us = 2415.68 us (332.715 GFLOPS/s)
+MUL_MAT f32 m=64 n=16 k=64: 256 x 7.2 us = 1843.36 us (18.0607 GFLOPS/s)
+MUL_MAT f32 m=64 n=96 k=64: 256 x 6.863 us = 1757.12 us (113.682 GFLOPS/s)
+MUL_MAT_ADD MUL_MAT_VEC ptq1_0 m=5120 n=1 k=17408: 1024 x 154.378 us = 158083 us (1154.65 GFLOPS/s)
+MUL_MAT_ADD MUL_MAT_VEC ptq1_0 m=5120 n=1 k=6144: 256 x 64.071 us = 16402.2 us (981.867 GFLOPS/s)
+MUL_MAT_VEC bf16 m=48 n=1 k=5120: 1536 x 11.289 us = 17341.2 us (43.5323 GFLOPS/s)
+MUL_MAT_VEC f32 m=1024 n=5 k=1024: 768 x 7.43 us = 5706.72 us (1410.47 GFLOPS/s)
+MUL_MAT_VEC f32 m=1024 n=6 k=1024: 768 x 7.768 us = 5966.36 us (1618.9 GFLOPS/s)
+MUL_MAT_VEC f32 m=256 n=4 k=256: 256 x 9.908 us = 2536.68 us (52.8074 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=1024 n=1 k=5120: 512 x 17.059 us = 8734.32 us (614.608 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=10240 n=1 k=5120: 768 x 112.683 us = 86541.1 us (930.456 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=12288 n=1 k=5120: 256 x 115.645 us = 29605.2 us (1087.95 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=17408 n=1 k=5120: 2048 x 158.323 us = 324247 us (1125.8 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=248320 n=1 k=5120: 16 x 2208.51 us = 35336.2 us (1151.25 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=5120 n=1 k=6144: 768 x 64.933 us = 49869.3 us (968.822 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=6144 n=1 k=5120: 768 x 62.89 us = 48299.8 us (1000.29 GFLOPS/s)
+RMS_NORM_MUL RMS_NORM(128,48,1,1): 768 x 9.663 us = 7421.32 us
+RMS_NORM_MUL RMS_NORM(256,24,1,1): 256 x 7.536 us = 1929.28 us
+RMS_NORM_MUL RMS_NORM(256,4,1,1): 256 x 6.504 us = 1665.16 us
+RMS_NORM_MUL RMS_NORM(5120,1,1,1): 2064 x 13.508 us = 27881.5 us
+ROPE: 512 x 7.342 us = 3759.56 us
+SCALE: 192 x 31.88 us = 6121 us
+SET_ROWS: 512 x 8.116 us = 4155.88 us
+SIGMOID: 1024 x 5.434 us = 5565.36 us
+SOFTPLUS: 768 x 6.034 us = 4634.84 us
+SSM_CONV_SILU SSM_CONV: 768 x 9.181 us = 7051.28 us
+Total time: 1.0512e+06 us.
+----------------
+Vulkan Timings:
+ADD: 1536 x 6.271 us = 9632.36 us
+CONCAT: 768 x 10.381 us = 7972.68 us
+CONT: 1024 x 5.532 us = 5665.04 us
+CPY: 768 x 6.594 us = 5064.32 us
+FLASH_ATTN_EXT dst(256,24,1,1),  q(256,1,24,1),  k(256,256,4,1),  v(256,256,4,1),  m(256,1,1,1): 256 x 207.122 us = 
+53023.4 us (30.3755 GFLOPS/s)
+GDN_STATE_CPY GATED_DELTA_NET: 768 x 49.984 us = 38387.8 us
+GET_ROWS: 784 x 7.17 us = 5621.36 us
+GLU: 1792 x 5.923 us = 10615 us
+L2_NORM: 768 x 6.653 us = 5110.08 us
+MUL: 1792 x 5.753 us = 10309.6 us
+MUL_FWHT MUL: 3360 x 7.749 us = 26037 us
+MUL_MAT f32 m=256 n=24 k=256: 256 x 9.058 us = 2319 us (346.586 GFLOPS/s)
+MUL_MAT f32 m=64 n=16 k=64: 256 x 6.648 us = 1702.08 us (19.5598 GFLOPS/s)
+MUL_MAT f32 m=64 n=96 k=64: 256 x 6.652 us = 1702.96 us (117.298 GFLOPS/s)
+MUL_MAT_ADD MUL_MAT_VEC ptq1_0 m=5120 n=1 k=17408: 1024 x 149.661 us = 153253 us (1191.04 GFLOPS/s)
+MUL_MAT_ADD MUL_MAT_VEC ptq1_0 m=5120 n=1 k=6144: 256 x 61.555 us = 15758.3 us (1021.99 GFLOPS/s)
+MUL_MAT_VEC bf16 m=48 n=1 k=5120: 1536 x 10.78 us = 16558.8 us (45.589 GFLOPS/s)
+MUL_MAT_VEC f32 m=1024 n=5 k=1024: 768 x 7.056 us = 5419.04 us (1485.34 GFLOPS/s)
+MUL_MAT_VEC f32 m=1024 n=6 k=1024: 768 x 7.266 us = 5580.76 us (1730.76 GFLOPS/s)
+MUL_MAT_VEC f32 m=256 n=4 k=256: 256 x 9.655 us = 2471.68 us (54.1962 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=1024 n=1 k=5120: 512 x 16.372 us = 8382.72 us (640.387 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=10240 n=1 k=5120: 768 x 97.404 us = 74806.8 us (1076.41 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=12288 n=1 k=5120: 256 x 115.755 us = 29633.3 us (1086.92 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=17408 n=1 k=5120: 2048 x 154.902 us = 317240 us (1150.66 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=248320 n=1 k=5120: 16 x 2216.85 us = 35469.6 us (1146.92 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=5120 n=1 k=6144: 768 x 59.2 us = 45465.8 us (1062.65 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=6144 n=1 k=5120: 768 x 61.268 us = 47054 us (1026.77 GFLOPS/s)
+RMS_NORM_MUL RMS_NORM(128,48,1,1): 768 x 8.733 us = 6707.04 us
+RMS_NORM_MUL RMS_NORM(256,24,1,1): 256 x 7.094 us = 1816.24 us
+RMS_NORM_MUL RMS_NORM(256,4,1,1): 256 x 6.079 us = 1556.24 us
+RMS_NORM_MUL RMS_NORM(5120,1,1,1): 2064 x 12.869 us = 26563.2 us
+ROPE: 512 x 6.793 us = 3478.08 us
+SET_ROWS: 512 x 7.671 us = 3927.72 us
+SIGMOID: 1024 x 5.011 us = 5132 us
+SOFTPLUS: 768 x 5.634 us = 4327.48 us
+SSM_CONV_SILU SSM_CONV: 768 x 8.44 us = 6482.68 us
+Total time: 1.00025e+06 us.
+----------------
+Vulkan Timings:
+ADD: 1536 x 6.266 us = 9624.68 us
+CONCAT: 768 x 10.128 us = 7778.8 us
+CONT: 1024 x 5.53 us = 5663.6 us
+CPY: 768 x 6.591 us = 5062.08 us
+FLASH_ATTN_EXT dst(256,24,1,1),  q(256,1,24,1),  k(256,256,4,1),  v(256,256,4,1),  m(256,1,1,1): 256 x 207.184 us = 
+53039.2 us (30.3665 GFLOPS/s)
+GDN_STATE_CPY GATED_DELTA_NET: 768 x 50.448 us = 38744.4 us
+GET_ROWS: 784 x 7.027 us = 5509.52 us
+GLU: 1792 x 5.924 us = 10617.3 us
+L2_NORM: 768 x 6.972 us = 5354.72 us
+MUL: 1792 x 5.832 us = 10451.6 us
+MUL_FWHT MUL: 3360 x 7.793 us = 26185.3 us
+MUL_MAT f32 m=256 n=24 k=256: 256 x 9.064 us = 2320.4 us (346.377 GFLOPS/s)
+MUL_MAT f32 m=64 n=16 k=64: 256 x 6.649 us = 1702.2 us (19.5584 GFLOPS/s)
+MUL_MAT f32 m=64 n=96 k=64: 256 x 6.655 us = 1703.8 us (117.24 GFLOPS/s)
+MUL_MAT_ADD MUL_MAT_VEC ptq1_0 m=5120 n=1 k=17408: 1024 x 148.641 us = 152209 us (1199.21 GFLOPS/s)
+MUL_MAT_ADD MUL_MAT_VEC ptq1_0 m=5120 n=1 k=6144: 256 x 62.626 us = 16032.4 us (1004.51 GFLOPS/s)
+MUL_MAT_VEC bf16 m=48 n=1 k=5120: 1536 x 10.679 us = 16403.7 us (46.0202 GFLOPS/s)
+MUL_MAT_VEC f32 m=1024 n=5 k=1024: 768 x 7.051 us = 5415.76 us (1486.24 GFLOPS/s)
+MUL_MAT_VEC f32 m=1024 n=6 k=1024: 768 x 7.662 us = 5884.88 us (1641.32 GFLOPS/s)
+MUL_MAT_VEC f32 m=256 n=4 k=256: 256 x 9.659 us = 2472.88 us (54.1699 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=1024 n=1 k=5120: 512 x 16.361 us = 8376.96 us (640.827 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=10240 n=1 k=5120: 768 x 97.158 us = 74617.4 us (1079.14 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=12288 n=1 k=5120: 256 x 114.985 us = 29436.2 us (1094.2 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=17408 n=1 k=5120: 2048 x 155.206 us = 317863 us (1148.41 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=248320 n=1 k=5120: 16 x 2223 us = 35568 us (1143.75 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=5120 n=1 k=6144: 768 x 59.489 us = 45688 us (1057.49 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=6144 n=1 k=5120: 768 x 61.234 us = 47028.4 us (1027.33 GFLOPS/s)
+RMS_NORM_MUL RMS_NORM(128,48,1,1): 768 x 8.8 us = 6759.16 us
+RMS_NORM_MUL RMS_NORM(256,24,1,1): 256 x 7.121 us = 1823.04 us
+RMS_NORM_MUL RMS_NORM(256,4,1,1): 256 x 6.063 us = 1552.16 us
+RMS_NORM_MUL RMS_NORM(5120,1,1,1): 2064 x 12.83 us = 26483.1 us
+ROPE: 512 x 6.784 us = 3473.68 us
+SET_ROWS: 512 x 7.655 us = 3919.76 us
+SIGMOID: 1024 x 5.007 us = 5127.48 us
+SOFTPLUS: 768 x 5.647 us = 4337.08 us
+SSM_CONV_SILU SSM_CONV: 768 x 8.441 us = 6482.88 us
+Total time: 1.00071e+06 us.
+| qwen35 27B PTQ1_0 - 1.75 bpw ternary (group 128) |   5.53 GiB |    26.90 B | Vulkan     |  99 |   q8_0 |   q4_0 |   1 |            tg48 |         14.03 ┬▒ 0.00 |
+----------------
+Vulkan Timings:
+ADD: 96 x 6.253 us = 600.32 us
+CONCAT: 48 x 9.972 us = 478.68 us
+CONT: 64 x 5.516 us = 353.08 us
+CPY: 48 x 6.56 us = 314.92 us
+FLASH_ATTN_EXT dst(256,24,1,1),  q(256,1,24,1),  k(256,256,4,1),  v(256,256,4,1),  m(256,1,1,1): 16 x 205.77 us = 
+3292.32 us (30.5752 GFLOPS/s)
+GDN_STATE_CPY GATED_DELTA_NET: 48 x 53.037 us = 2545.8 us
+GET_ROWS: 49 x 6.959 us = 341 us
+GLU: 112 x 5.893 us = 660.08 us
+L2_NORM: 48 x 6.573 us = 315.52 us
+MUL: 112 x 5.744 us = 643.36 us
+MUL_FWHT MUL: 210 x 7.723 us = 1622 us
+MUL_MAT f32 m=256 n=24 k=256: 16 x 9.032 us = 144.52 us (347.587 GFLOPS/s)
+MUL_MAT f32 m=64 n=16 k=64: 16 x 6.625 us = 106 us (19.6299 GFLOPS/s)
+MUL_MAT f32 m=64 n=96 k=64: 16 x 6.61 us = 105.76 us (118.047 GFLOPS/s)
+MUL_MAT_ADD MUL_MAT_VEC ptq1_0 m=5120 n=1 k=17408: 64 x 148.153 us = 9481.84 us (1203.16 GFLOPS/s)
+MUL_MAT_ADD MUL_MAT_VEC ptq1_0 m=5120 n=1 k=6144: 16 x 61.495 us = 983.92 us (1023 GFLOPS/s)
+MUL_MAT_VEC bf16 m=48 n=1 k=5120: 96 x 10.687 us = 1026.04 us (45.9839 GFLOPS/s)
+MUL_MAT_VEC f32 m=1024 n=5 k=1024: 48 x 7.015 us = 336.72 us (1494.03 GFLOPS/s)
+MUL_MAT_VEC f32 m=1024 n=6 k=1024: 48 x 7.255 us = 348.28 us (1733.33 GFLOPS/s)
+MUL_MAT_VEC f32 m=256 n=4 k=256: 16 x 9.575 us = 153.2 us (54.649 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=1024 n=1 k=5120: 32 x 16.281 us = 521 us (643.976 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=10240 n=1 k=5120: 48 x 96.19 us = 4617.12 us (1090 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=12288 n=1 k=5120: 16 x 114.682 us = 1834.92 us (1097.09 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=17408 n=1 k=5120: 128 x 153.726 us = 19677 us (1159.47 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=248320 n=1 k=5120: 1 x 2237.56 us = 2237.56 us (1136.3 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=5120 n=1 k=6144: 48 x 59.535 us = 2857.72 us (1056.67 GFLOPS/s)
+MUL_MAT_VEC ptq1_0 m=6144 n=1 k=5120: 48 x 60.583 us = 2908 us (1038.38 GFLOPS/s)
+RMS_NORM_MUL RMS_NORM(128,48,1,1): 48 x 8.678 us = 416.56 us
+RMS_NORM_MUL RMS_NORM(256,24,1,1): 16 x 7.12 us = 113.92 us
+RMS_NORM_MUL RMS_NORM(256,4,1,1): 16 x 6.037 us = 96.6 us
+RMS_NORM_MUL RMS_NORM(5120,1,1,1): 129 x 12.728 us = 1642.04 us
+ROPE: 32 x 6.761 us = 216.36 us
+SET_ROWS: 32 x 7.641 us = 244.52 us
+SIGMOID: 64 x 4.981 us = 318.8 us
+SOFTPLUS: 48 x 5.653 us = 271.36 us
+SSM_CONV_SILU SSM_CONV: 48 x 8.42 us = 404.2 us
+Total time: 62231 us.
+
+build: 13b1079f4 (10723)

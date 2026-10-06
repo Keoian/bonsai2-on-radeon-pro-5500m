@@ -6,6 +6,7 @@ Record of tuning Bonsai 2 27B PTQ1_0 on the Radeon Pro 5500M 8 GB (Vulkan, Windo
 - `RESULTS.md`: every experiment (wins, losses, failures). Read before trying something, so nothing is retried blind.
 - `FACTS.md`: Step 0 measurements of the GPU and the start build (int dot, BAR heap, bandwidth, per-kernel times).
 - `MISSION.md`: the brief the run followed. `p100-notes.md`: lessons from the earlier Tesla P100 run it builds on.
+- `logs/`: `vulkaninfo` dump and `GGML_VK_PERF_LOGGER` per-kernel logs (start build and experiments) behind FACTS/RESULTS.
 - `patches/`: reverted experiments worth revisiting (`git apply` on top of the branch). The int8 prefill GEMM in
   `exp4-mmq-ptq1_0-final.patch` is +34% pp but failed the KLD gate.
 
