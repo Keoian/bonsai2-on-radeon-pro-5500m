@@ -84,10 +84,20 @@ if (-not $NoVision) {
 }
 if ($Extra) { $Args_ += ($Extra | Where-Object { $_ -ne "--" }) }
 
+# Hybrid graphics (GMUX mode 5): the Intel iGPU is also a Vulkan device and is listed first, and
+# llama.cpp would split the model across both. Pin the Radeon by name unless -dev/--device was given.
+if (-not $Cpu -and -not ($Args_ | Where-Object { $_ -in "-dev", "--device" })) {
+    $ErrorActionPreference = "Continue"
+    $Radeon = & (Join-Path $RepoRoot "build\bin\llama-bench.exe") --list-devices 2>&1 |
+        ForEach-Object { "$_" } | Select-String '^\s*(Vulkan\d+): .*Radeon' | Select-Object -First 1
+    $ErrorActionPreference = "Stop"
+    if ($Radeon) { $Args_ += @("-dev", $Radeon.Matches[0].Groups[1].Value) }
+}
+
 Write-Host ""
 Write-Host "=== Bonsai 2 27B / llama-server ===" -ForegroundColor Green
 Write-Host "  Model:   $Gguf"
-Write-Host ("  Backend: " + $(if ($Ngl -gt 0) { "Vulkan, -ngl $Ngl" } else { "CPU" }))
+Write-Host ("  Backend: " + $(if ($Ngl -gt 0) { "Vulkan, -ngl $Ngl" + $(if ($Radeon) { ", device $($Radeon.Matches[0].Groups[1].Value)" } else { "" }) } else { "CPU" }))
 Write-Host "  Context: $Ctx (KV cache K=$CacheK V=$CacheV)"
 Write-Host ("  UI:      http://localhost:$Port" + $(if ($Lan) { "  (LAN: http://$((Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.*' } | Select-Object -First 1).IPAddress):$Port)" } else { "" }))
 Write-Host "  API:     http://localhost:$Port/v1/chat/completions"
