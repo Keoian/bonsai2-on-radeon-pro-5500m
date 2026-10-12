@@ -3,7 +3,7 @@
   Start llama-server for Bonsai 2 27B with the tuned Vulkan settings and serve the chat UI.
 
 .EXAMPLE
-  .\start-server.ps1                 # Vulkan, PTQ1_0, 32k context, KV cache q8_0 keys + q4_0 values
+  .\start-server.ps1                 # Vulkan, PTQ1_0, 64k context, KV cache q8_0 keys + q4_0 values
   .\start-server.ps1 -CacheK f16 -CacheV f16 -Ctx 16384   # full-precision KV cache; 16k is its limit in 8 GB
   .\start-server.ps1 -Lan            # also reachable from other machines on the LAN
   .\start-server.ps1 -Model pq2      # use the PQ2_0 file instead
@@ -26,7 +26,7 @@ param(
     [switch] $Cpu,
     [switch] $NoVision,
     [switch] $MmprojGpu,
-    [int]    $Ctx = 32768,
+    [int]    $Ctx = 65536,
     # KV cache precision. On the 8 GB 5500M at 32k: q8_0/q8_0 fits but decode drops to ~9 tok/s (VRAM
     # nearly full); q8_0 keys + q4_0 values keeps ~14 tok/s. Keys are the precision-sensitive half.
     [ValidateSet("f16", "q8_0", "q4_0")] [string] $CacheK = "q8_0",
