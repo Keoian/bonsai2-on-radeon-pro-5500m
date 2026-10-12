@@ -122,14 +122,20 @@
 
     <h2>Thinking</h2>
     <label>Reasoning effort</label>
+    <select id="effort">
+      <option value="medium">Medium (recommended)</option>
+      <option value="xhigh">xhigh (model default, much longer thinking)</option>
+    </select>
+    <label>Thinking budget</label>
     <select id="reasoning">
       <option value="0">Off (no thinking)</option>
-      <option value="512">Low (512 tokens)</option>
-      <option value="2048">Medium (2048 tokens)</option>
-      <option value="8192">High (8192 tokens)</option>
-      <option value="-1">Max (unlimited)</option>
+      <option value="512">512 tokens</option>
+      <option value="2048">2048 tokens</option>
+      <option value="4096">4096 tokens</option>
+      <option value="8192">8192 tokens</option>
+      <option value="-1">Unlimited</option>
     </select>
-    <p class="hint">Sent per request as <code>thinking_budget_tokens</code>. On slow GPUs, Medium keeps most of the quality at a bounded wait.</p>
+    <p class="hint">Effort sets how thoroughly the model plans to think (<code>reasoning_effort</code>); the budget is a hard cap (<code>thinking_budget_tokens</code>). Medium is about as accurate as xhigh at roughly a third fewer tokens.</p>
 
     <h2>Sampling</h2>
     <div class="presets">
@@ -142,8 +148,10 @@
     </div>
     <div class="row">
       <div><label>Top-k</label><input id="topK" type="number" step="1" min="0"></div>
-      <div><label>Presence penalty</label><input id="presence" type="number" step="0.1" min="0" max="2"></div>
+      <div><label>Min-p</label><input id="minP" type="number" step="0.01" min="0" max="1"></div>
     </div>
+    <label>Presence penalty</label>
+    <input id="presence" type="number" step="0.1" min="0" max="2">
     <label>Max reply tokens (-1 = unlimited)</label>
     <input id="maxTokens" type="number" step="256" min="-1">
 
@@ -182,7 +190,7 @@
   const els = {
     status: $('status'), messages: $('messages'), chat: $('chat'), input: $('input'), send: $('send'),
     settings: $('settings'), serverUrl: $('serverUrl'), serverInfo: $('serverInfo'), reasoning: $('reasoning'),
-    temp: $('temp'), topP: $('topP'), topK: $('topK'), presence: $('presence'), maxTokens: $('maxTokens'),
+    effort: $('effort'), temp: $('temp'), topP: $('topP'), topK: $('topK'), minP: $('minP'), presence: $('presence'), maxTokens: $('maxTokens'),
     systemPrompt: $('systemPrompt'), theme: $('theme'), attachBtn: $('attachBtn'), fileInput: $('fileInput'),
     attachRow: $('attachRow'), attachPreview: $('attachPreview'), attachName: $('attachName'), attachClear: $('attachClear'),
   };
@@ -195,25 +203,25 @@
 
   const defaultServer = (location.protocol === 'http:' || location.protocol === 'https:') ? location.origin : 'http://localhost:8080';
   const settings = Object.assign({
-    serverUrl: defaultServer, reasoning: '2048', temp: 1.0, topP: 0.95, topK: 20, presence: 0,
+    serverUrl: defaultServer, reasoning: '2048', effort: 'medium', temp: 1.0, topP: 0.95, topK: 20, minP: 0.05, presence: 0,
     maxTokens: -1, systemPrompt: '', theme: '',
   }, store.get('bonsai.settings', {}));
 
-  const PRESET_THINK   = { temp: 1.0, topP: 0.95, topK: 20, presence: 0 };
-  const PRESET_NOTHINK = { temp: 0.7, topP: 0.8,  topK: 20, presence: 1.5 };
+  const PRESET_THINK   = { temp: 1.0, topP: 0.95, topK: 20, minP: 0.05, presence: 0 };
+  const PRESET_NOTHINK = { temp: 0.7, topP: 0.8,  topK: 20, minP: 0,    presence: 1.5 };
 
   function applySettingsToForm() {
-    els.serverUrl.value = settings.serverUrl; els.reasoning.value = settings.reasoning;
-    els.temp.value = settings.temp; els.topP.value = settings.topP; els.topK.value = settings.topK;
+    els.serverUrl.value = settings.serverUrl; els.reasoning.value = settings.reasoning; els.effort.value = settings.effort;
+    els.temp.value = settings.temp; els.topP.value = settings.topP; els.topK.value = settings.topK; els.minP.value = settings.minP;
     els.presence.value = settings.presence; els.maxTokens.value = settings.maxTokens;
     els.systemPrompt.value = settings.systemPrompt; els.theme.value = settings.theme;
     document.documentElement.dataset.theme = settings.theme;
   }
   function readForm() {
     settings.serverUrl = els.serverUrl.value.trim().replace(/\/+$/, '') || defaultServer;
-    settings.reasoning = els.reasoning.value;
+    settings.reasoning = els.reasoning.value; settings.effort = els.effort.value;
     settings.temp = parseFloat(els.temp.value); settings.topP = parseFloat(els.topP.value);
-    settings.topK = parseInt(els.topK.value, 10); settings.presence = parseFloat(els.presence.value);
+    settings.topK = parseInt(els.topK.value, 10); settings.minP = parseFloat(els.minP.value); settings.presence = parseFloat(els.presence.value);
     settings.maxTokens = parseInt(els.maxTokens.value, 10);
     settings.systemPrompt = els.systemPrompt.value; settings.theme = els.theme.value;
     document.documentElement.dataset.theme = settings.theme;
@@ -396,12 +404,12 @@
 
     const body = {
       messages: apiMessages(), stream: true, timings_per_token: false,
-      temperature: settings.temp, top_p: settings.topP, top_k: settings.topK,
+      temperature: settings.temp, top_p: settings.topP, top_k: settings.topK, min_p: settings.minP,
       presence_penalty: settings.presence,
       thinking_budget_tokens: parseInt(settings.reasoning, 10),
     };
     if (settings.maxTokens > 0) body.max_tokens = settings.maxTokens;
-    if (settings.reasoning === '0') body.chat_template_kwargs = { enable_thinking: false };
+    body.chat_template_kwargs = settings.reasoning === '0' ? { enable_thinking: false } : { reasoning_effort: settings.effort };
 
     const refresh = () => {
       bodyEl.innerHTML = md(reply.content);
