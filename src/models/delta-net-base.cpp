@@ -553,7 +553,38 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const bool keep = cparams.n_rs_seq > 0;
 
-    GGML_ASSERT(state_rows == nullptr || keep); // rows mode is a ring-path optimization
+    if (!keep && state_rows) {
+        // rows mode without rollback slots: the fused op reads the live state row in place (no gather),
+        // the single new state is copied back to the head cell as in the gathered path
+        const bool raw = gdn_raw_beta && gdn_raw_alpha && gdn_raw_dt_bias && gdn_raw_a;
+        ggml_tensor * gdn_out = ggml_gated_delta_net_rows(ctx0, q, k, v, raw ? gdn_raw_alpha : g, raw ? gdn_raw_beta : b,
+                                                          s, state_rows, 1);
+        if (raw) {
+            ggml_gated_delta_net_set_raw_gates(gdn_out, gdn_raw_dt_bias, gdn_raw_a);
+        }
+        res->add_fused_node({n_seq_tokens > 1 ? LLM_FUSED_OP_GDN_CH : LLM_FUSED_OP_GDN_AR, gdn_out, il});
+
+        const int64_t D = S_v * S_v * H_v;
+        const int64_t attn_score_elems = S_v * H_v * n_seq_tokens * n_seqs;
+
+        ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
+            S_v, H_v, n_seq_tokens, n_seqs,
+            ggml_row_size(gdn_out->type, S_v),
+            ggml_row_size(gdn_out->type, S_v * H_v),
+            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
+            0);
+        cb(output, "attn_output", il);
+
+        ggml_tensor * new_state = ggml_view_2d(ctx0, gdn_out, D, n_seqs,
+            ggml_row_size(gdn_out->type, D), ggml_row_size(gdn_out->type, attn_score_elems));
+
+        ggml_build_forward_expand(gf,
+                ggml_cpy(ctx0, new_state,
+                    ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+
+        return output;
+    }
 
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);

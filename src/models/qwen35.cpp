@@ -156,7 +156,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         // integrated GPUs (e.g. unified-memory CUDA devices) report IGPU, not GPU
         const bool is_gpu = ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
                             ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_IGPU;
-        if (is_gpu && strcmp(reg_name, "MTL") != 0) {
+        if (is_gpu && strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "Vulkan") != 0) {
             gdn_state_rows_dev_ok = false;
         }
         if (strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "CUDA") != 0 &&
@@ -479,7 +479,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // GPU device in the model is Metal.
     static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
 
-    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0;
+    // without rollback slots (n_rs_seq == 0) rows mode needs the fused op for this ubatch shape and no extra
+    // state relocation in the same graph (see the ordering hazard noted in build_rs_cache_view)
+    const bool gdn_fused = n_seq_tokens == 1 ? cparams.fused_gdn_ar : cparams.fused_gdn_ch;
+    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok &&
+        (cparams.n_rs_seq > 0 || (gdn_fused && mctx_cur->get_n_rs() == (uint32_t) n_seqs));
 
     ggml_tensor * state;
     if (gdn_state_rows) {
@@ -634,6 +638,20 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
 
         tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+
+        // a Hadamard-latent embedding table stores rotated rows; restore the primal
+        // basis right after the lookup (h = s * (H z)), exactly like the trunk path in
+        // llm_graph_context::build_inp_embd. Without this the draft head consumes
+        // embeddings in the rotated basis and llama_verify_hadamard_graph refuses the graph.
+        if (hadamard_inverses) {
+            const auto it = hadamard_inverses->find(tok_embd_w);
+            if (it != hadamard_inverses->end()) {
+                tok_embd = llama_mul_mat_hadamard(ctx0, tok_embd, it->second.rot);
+                if (it->second.signs) {
+                    tok_embd = ggml_mul(ctx0, tok_embd, it->second.signs);
+                }
+            }
+        }
     } else {
         tok_embd = inp->embd;
     }

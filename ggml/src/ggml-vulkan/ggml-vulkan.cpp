@@ -1874,6 +1874,8 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    uint32_t use_rows;
+    uint32_t state_out;
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -3782,6 +3784,15 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 
     result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
 
+    // AMD RDNA with head size >= 256: 16 rows per workgroup spills registers in the scalar path (8 is ~3x
+    // faster for prefill), and a wider d_split speeds up few-row decode (Radeon Pro 5500M, hsk = hsv = 256)
+    if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN && hsk >= 256 && hsv >= 256) {
+        result.block_rows = std::min(result.block_rows, 8u);
+        if (n_rows <= 8) {
+            result.d_split = std::min(std::min(result.subgroup_size, 16u), D_lsb / 4);
+        }
+    }
+
     if (!reduce_block_rows && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
         result.block_rows /= 2;
     }
@@ -4212,6 +4223,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                             l_mmq_wg_denoms, m_mmq_wg_denoms, s_mmq_wg_denoms,
                             l_mmq_wg_denoms_k, m_mmq_wg_denoms_k, s_mmq_wg_denoms_k,
                             l_mmqid_wg_denoms, m_mmqid_wg_denoms, s_mmqid_wg_denoms;
+    // PTQ1_0 float mat-mat tiles (default: the regular quant tiles)
+    std::vector<uint32_t> l_warptile_mmq_ptq1, m_warptile_mmq_ptq1, s_warptile_mmq_ptq1;
+    std::array<uint32_t, 3> l_mmq_wg_denoms_ptq1, m_mmq_wg_denoms_ptq1, s_mmq_wg_denoms_ptq1;
 
     uint32_t l_align, m_align, s_align;
 
@@ -4571,6 +4585,18 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 #endif
 
+    l_warptile_mmq_ptq1 = l_warptile_mmq; m_warptile_mmq_ptq1 = m_warptile_mmq; s_warptile_mmq_ptq1 = s_warptile_mmq;
+    l_mmq_wg_denoms_ptq1 = l_mmq_wg_denoms; m_mmq_wg_denoms_ptq1 = m_mmq_wg_denoms; s_mmq_wg_denoms_ptq1 = s_mmq_wg_denoms;
+    if (device->architecture == AMD_RDNA1 && !device->coopmat_support && !device->coopmat2) {
+        // RDNA1 without matrix cores (the regular large tile is disabled on AMD): a 64x128 tile with TN = 4 is ~10%
+        // faster than the 64x64 medium tile for PTQ1_0 prefill ubatches; ggml_vk_guess_matmul_pipeline picks it when
+        // its column padding is small (Radeon Pro 5500M)
+        const uint32_t sg8 = std::max(device->subgroup_size, 8u);
+        l_warptile_mmq_ptq1 = { 128, 64, 128, 32, sg8, 64, 2, 4, 4, 1, sg8 };
+        l_mmq_wg_denoms_ptq1 = { 64, 128, 1 };
+        device->mul_mat_l[GGML_TYPE_PTQ1_0] = true;
+    }
+
 #if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
     if (device->coopmat2) {
         for (auto &fa : device->pipeline_flash_attn_f32_f16) {
@@ -4911,7 +4937,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM_NODOT2(GGML_TYPE_BF16, pipeline_matmul_bf16, matmul_bf16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
 
         CREATE_MM2(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q1_0], matmul_q1_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
-        CREATE_MM2(GGML_TYPE_PTQ1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_PTQ1_0], matmul_ptq1_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+        CREATE_MM2(GGML_TYPE_PTQ1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_PTQ1_0], matmul_ptq1_0_f32, mmq_wg_denoms_ptq1, warptile_mmq_ptq1, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_PQ2_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_PQ2_0], matmul_pq2_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_0], matmul_q2_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0], matmul_q4_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
@@ -5823,7 +5849,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         int idx = 0;
         const uint32_t sg = std::max(device->subgroup_size, 1u);
         for (uint32_t n : {64, 128, 256, 512, 1024, 2048, 4096, 8192}) {
-            const bool wide = n > GGML_VK_FWHT_MAX_SUBGROUP_N || n / sg > GGML_VK_FWHT_MAX_SUBGROUP_EL_W;
+            // AMD: from n = 1024 the one-subgroup-per-row variant serializes too much for the few rows of decode
+            // (Radeon Pro 5500M: 21 us -> 7.7 us per 1024-wide transform with the shared-memory variant)
+            const uint32_t max_subgroup_n = device->vendor_id == VK_VENDOR_ID_AMD ? 512u : GGML_VK_FWHT_MAX_SUBGROUP_N;
+            const bool wide = n > max_subgroup_n || n / sg > GGML_VK_FWHT_MAX_SUBGROUP_EL_W;
             if (use_subgroup && !wide) {
                 if (device->subgroup_size <= n) {
                     ggml_vk_create_pipeline(device, device->pipeline_fwht_f32[idx], "fwht_f32", fwht_f32_len, fwht_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
@@ -5977,7 +6006,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                    gdn_names[si][kda], gdn_len, gdn_data, "main", 9, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
             }
         }
@@ -6269,6 +6298,21 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         const char* GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM = getenv("GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM");
         device->disable_host_visible_vidmem = GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM != nullptr;
+        if (!device->disable_host_visible_vidmem) {
+            // Without resizable BAR, host-visible vidmem is a small (typically 256 MiB) window shared with the rest of the
+            // system. Buffers placed there are demoted to system memory under pressure (seen on Windows AMD), so only use it
+            // when it is large.
+            const vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+            bool large_bar = false;
+            for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+                const vk::MemoryPropertyFlags flags = mem_props.memoryTypes[i].propertyFlags;
+                if ((flags & vk::MemoryPropertyFlagBits::eDeviceLocal) && (flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
+                    mem_props.memoryHeaps[mem_props.memoryTypes[i].heapIndex].size >= 1024ull * 1024 * 1024) {
+                    large_bar = true;
+                }
+            }
+            device->disable_host_visible_vidmem = !large_bar;
+        }
 
         const char* GGML_VK_ALLOW_SYSMEM_FALLBACK = getenv("GGML_VK_ALLOW_SYSMEM_FALLBACK");
         device->allow_sysmem_fallback = GGML_VK_ALLOW_SYSMEM_FALLBACK != nullptr;
@@ -8913,7 +8957,11 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     if ((mm_s && (m <= 32 || n <= 32)) || (!mm_m && !mm_l)) {
         return aligned ? mmp->a_s : mmp->s;
     }
-    if ((mm_m && (m <= 64 || n <= 64)) || !mm_l) {
+    // RDNA1 PTQ1_0: the large pipeline is a 64x128 tile, ~10% faster per column than the 64x64 medium tile; use it
+    // unless its column padding costs more than that (e.g. n = 296 -> 384 vs 320 columns)
+    const bool ptq1_wide = ctx->device->architecture == AMD_RDNA1 && src0_type == GGML_TYPE_PTQ1_0 && !is_q8_1;
+    const bool ptq1_pad  = ptq1_wide && CEIL_DIV(n, 128) * 128 * 10 > CEIL_DIV(n, 64) * 64 * 11;
+    if ((mm_m && (m <= 64 || n <= 64 || ptq1_pad)) || !mm_l) {
         return aligned ? mmp->a_m : mmp->m;
     }
     return aligned ? mmp->a_l : mmp->l;
@@ -9592,7 +9640,13 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
         }
     case VK_VENDOR_ID_INTEL:
         if (device->architecture == vk_device_architecture::INTEL_XE2) {
-            if (src0_type == GGML_TYPE_Q2_0 || src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_Q6_K) {
+            // PTQ1_0 is listed here because it has a dedicated integer-dot mat-vec shader
+            // (mul_mat_vecq_ptq1_0.comp); without it the blanket Intel-Windows opt-out below
+            // keeps PTQ1_0 on the dequant path. Measured on Arc B390 (Bonsai 2 27B, tg128):
+            // 1.62 -> 13.16 t/s. PQ2_0 is deliberately NOT listed - measured 11.56 -> 11.63 t/s,
+            // i.e. no gain over its dequant mat-vec, so it stays on the existing path.
+            if (src0_type == GGML_TYPE_Q2_0 || src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_Q6_K ||
+                src0_type == GGML_TYPE_PTQ1_0) {
                 return true;
             }
         }
@@ -10091,6 +10145,37 @@ static bool ggml_vk_can_use_fwht(const ggml_backend_vk_context * ctx, const ggml
     }
     GGML_ASSERT(ggml_is_contiguous(dst));
 
+    return true;
+}
+
+// GATED_DELTA_NET (K = 1, one sequence) ... empty ops ... CPY(view of the GDN state, cache row): the GDN kernel
+// writes the final state straight into the CPY destination instead of its own output followed by a copy.
+static bool ggml_vk_can_fuse_gdn_state_cpy(const struct ggml_cgraph * cgraph, int node_idx, int * dist) {
+    const ggml_tensor * gdn = cgraph->nodes[node_idx];
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || ggml_get_op_params_i32(gdn, 0) != 1 || gdn->src[2]->ne[3] != 1) {
+        return false;
+    }
+    int j = node_idx + 1;
+    while (j < cgraph->n_nodes && j - node_idx <= 4 && ggml_op_is_empty(cgraph->nodes[j]->op)) {
+        ++j;
+    }
+    if (j >= cgraph->n_nodes || j - node_idx > 4) {
+        return false;
+    }
+    const ggml_tensor * cpy = cgraph->nodes[j];
+    if (cpy->op != GGML_OP_CPY || cpy->type != GGML_TYPE_F32 || !ggml_is_contiguous(cpy)) {
+        return false;
+    }
+    const ggml_tensor * st = cpy->src[0];
+    const int64_t S_v = gdn->src[2]->ne[0];
+    const int64_t H   = gdn->src[2]->ne[1];
+    const int64_t T   = gdn->src[2]->ne[2];
+    if (st->view_src != gdn || st->type != GGML_TYPE_F32 || !ggml_is_contiguous(st) ||
+        st->view_offs != (size_t) (S_v * H * T) * sizeof(float) ||
+        ggml_nelements(st) != S_v * S_v * H) {
+        return false;
+    }
+    *dist = j - node_idx;
     return true;
 }
 
@@ -12958,7 +13043,8 @@ static void ggml_vk_gated_linear_attn(ggml_backend_vk_context * ctx, vk_context&
         pc, { (uint32_t)(n_seqs * n_heads), 1, 1 });
 }
 
-static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+// state_cpy: the fused CPY (see ggml_vk_can_fuse_gdn_state_cpy) whose destination receives the final state
+static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const ggml_tensor * state_cpy = nullptr) {
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_v     = dst->src[2];
     const ggml_tensor * src_beta  = dst->src[4];
@@ -12999,6 +13085,11 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     const uint32_t neq1 = (uint32_t)src_q->ne[1];
     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
 
+    // rows mode (src[6]): src[5] is the 2D state cache and seq s reads row src[6][s]
+    const bool use_rows = dst->src[6] != nullptr;
+    const vk_subbuffer rows_buf = use_rows ? ggml_vk_tensor_subbuffer(ctx, dst->src[6]) : src_buf[5];
+    const vk_subbuffer state_out_buf = state_cpy ? ggml_vk_tensor_subbuffer(ctx, state_cpy) : dst_buf;
+
     const float scale = 1.0f / sqrtf((float)S_v);
     const vk_op_gated_delta_net_push_constants pc = {
         H, n_tokens, n_seqs, s_off,
@@ -13007,11 +13098,13 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         sb1, sb2, sb3,
         neq1, rq3,
         scale,
-        K
+        K,
+        use_rows ? 1u : 0u,
+        state_cpy ? 1u : 0u
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, rows_buf, state_out_buf},
         pc, { H, n_seqs, S_v });
 }
 
@@ -16016,7 +16109,8 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
 
     case GGML_OP_GATED_DELTA_NET:
-        ggml_vk_gated_delta_net(ctx, compute_ctx, node);
+        ggml_vk_gated_delta_net(ctx, compute_ctx, node,
+            ctx->num_additional_fused_ops > 0 ? cgraph->nodes[node_idx + ctx->num_additional_fused_ops] : nullptr);
 
         break;
 
@@ -17467,9 +17561,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_scale = false;
         const char *fusion_string {};
         int mm_fwht_dist = 0;
+        int gdn_cpy_dist = 0;
+        bool gdn_state_cpy = false;
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
-            if (num_adds) {
+            if (ggml_vk_can_fuse_gdn_state_cpy(cgraph, i, &gdn_cpy_dist)) {
+                ctx->num_additional_fused_ops = gdn_cpy_dist;
+                fusion_string = "GDN_STATE_CPY";
+                gdn_state_cpy = true;
+                // the GDN output (attention scores) is still read by later nodes
+                ctx->fused_ops_write_mask |= 1;
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
@@ -17624,8 +17727,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_ops_write_mask |= 1 << ctx->num_additional_fused_ops;
 
         // Check whether fusion would overwrite src operands while they're still in use.
-        // If so, disable fusion.
-        if (ctx->num_additional_fused_ops) {
+        // If so, disable fusion. GDN_STATE_CPY overlaps its state source by design (see its matcher).
+        if (ctx->num_additional_fused_ops && !gdn_state_cpy) {
             // There are up to two output nodes - topk_moe has two.
             uint32_t bits = ctx->fused_ops_write_mask & ~(1 << ctx->num_additional_fused_ops);
             ggml_tensor *output_nodes[2] {};
@@ -18797,8 +18900,17 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && op->src[0]->ne[0] == 64;
         case GGML_OP_GATED_DELTA_NET:
             {
-                // rows-indexed state read (src[6]) not implemented on Vulkan yet
-                if (op->src[6] != nullptr) {
+                // rows-indexed state read (src[6]): int32 row per seq
+                if (op->src[6] != nullptr && (op->src[6]->type != GGML_TYPE_I32 || !ggml_is_contiguous(op->src[6]))) {
+                    return false;
+                }
+                // raw gates (ggml_gated_delta_net_set_raw_gates): beta and g arrive
+                // pre-activation and need beta = sigmoid(beta) and
+                // g = a * softplus(g + dt_bias), with dt_bias in src[7] and a in src[8].
+                // gated_delta_net.comp has neither those bindings nor that math - it
+                // applies exp(g) unconditionally - so the shader silently returns wrong
+                // results for this case. Decline it and let it fall back to the CPU.
+                if (ggml_get_op_params_i32(op, 1) != 0) {
                     return false;
                 }
                 const uint32_t S_v = op->src[2]->ne[0];

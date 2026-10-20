@@ -3,13 +3,14 @@
   Start llama-server for Bonsai 2 27B with the tuned Vulkan settings and serve the chat UI.
 
 .EXAMPLE
-  .\start-server.ps1                 # Vulkan, PTQ1_0, 32k context, KV cache q8_0 keys + q4_0 values
-  .\start-server.ps1 -CacheK f16 -CacheV f16 -Ctx 16384   # full-precision KV cache; 16k is its limit in 8 GB
+  .\start-server.ps1                 # Vulkan, PTQ1_0, 16k context, KV cache q8_0 keys + q4_0 values
+  .\start-server.ps1 -CacheK f16 -CacheV f16   # full-precision KV cache (16k is its limit in 8 GB)
+  .\start-server.ps1 -Ctx 32768     # 32k needs an otherwise empty GPU (browser tabs etc. closed)
   .\start-server.ps1 -Lan            # also reachable from other machines on the LAN
   .\start-server.ps1 -Model pq2      # use the PQ2_0 file instead
   .\start-server.ps1 -Cpu            # CPU only (PQ2_0), for machines without a usable GPU
   .\start-server.ps1 -Parallel 2    # more concurrent chats (each slot costs VRAM; 1 fits the 8 GB 5500M)
-  .\start-server.ps1 -Ctx 16384 -NoVision -- --reasoning-budget 2048   # extra llama-server flags after --
+  .\start-server.ps1 -NoVision -- --reasoning-budget 2048   # extra llama-server flags after --
 
   .\start-server.ps1 -ModelDir D:\models   # where the .gguf files live (see below)
 
@@ -26,7 +27,9 @@ param(
     [switch] $Cpu,
     [switch] $NoVision,
     [switch] $MmprojGpu,
-    [int]    $Ctx = 32768,
+    # 16k by default: 32k only fits on the 8 GB 5500M when nothing else holds VRAM -- with a browser
+    # open the KV-cache allocation fails (ErrorOutOfDeviceMemory, 2026-09-21). Pass -Ctx 32768 to try.
+    [int]    $Ctx = 16384,
     # KV cache precision. On the 8 GB 5500M at 32k: q8_0/q8_0 fits but decode drops to ~9 tok/s (VRAM
     # nearly full); q8_0 keys + q4_0 values keeps ~14 tok/s. Keys are the precision-sensitive half.
     [ValidateSet("f16", "q8_0", "q4_0")] [string] $CacheK = "q8_0",

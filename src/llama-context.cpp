@@ -68,6 +68,10 @@ static void llama_verify_hadamard_graph(
 
         const auto it = rotations.find(node->src[0]);
         if (it == rotations.end()) {
+            if (inverses.count(node->src[0])) {
+                throw std::runtime_error(format(
+                    "Hadamard-latent table '%s' is used as a head without a forward transform", node->src[0]->name));
+            }
             continue;
         }
         const ggml_tensor * src = unwrap(node->src[1]);
@@ -235,6 +239,15 @@ llama_context::llama_context(
             }
             cparams.ctx_other = params.ctx_other;
         }
+    }
+
+    hadamard_rotations = model.hadamard_rotations;
+    hadamard_inverses  = model.hadamard_inverses;
+    if (cparams.ctx_other) {
+        // Transform entries are keyed by tensor pointer, so borrowed target tensors remain distinct.
+        const auto & other = cparams.ctx_other->model;
+        hadamard_rotations.insert(other.hadamard_rotations.begin(), other.hadamard_rotations.end());
+        hadamard_inverses .insert(other.hadamard_inverses .begin(), other.hadamard_inverses .end());
     }
 
     auto rope_scaling_type = params.rope_scaling_type;
@@ -2564,6 +2577,10 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_MINIMAX_01 ||
         model.arch == LLM_ARCH_MINIMAX_M3) {
         res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+    } else if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
+        // DFlash2's convolutions and selector are shape work rather than matmuls,
+        // so they cost ~8.6 nodes per tensor against ~5.9 for a plain DFlash draft
+        res = std::max<uint32_t>(1024u, 12u*model.n_tensors());
     } else {
         res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
         for (const auto & lora : model.loras) {
@@ -2689,8 +2706,8 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // verify transform coverage on the pristine graph: after scheduling,
     // cross-backend copies break the producer chain the check follows
-    if (!hadamard_verified && gf && (!model.hadamard_rotations.empty() || !model.hadamard_inverses.empty())) {
-        llama_verify_hadamard_graph(gf, model.hadamard_rotations, model.hadamard_inverses);
+    if (!hadamard_verified && gf && (!hadamard_rotations.empty() || !hadamard_inverses.empty())) {
+        llama_verify_hadamard_graph(gf, hadamard_rotations, hadamard_inverses);
         hadamard_verified = true;
     }
 
@@ -2733,8 +2750,8 @@ llm_graph_params llama_context::graph_params(
         /*.dspark_has_context =*/!dspark_ctx.v_ctx_feat.empty(),
         /*.dspark_ctx_rows =*/dspark_ctx.n_ctx_rows,
         /*.dspark_ctx_width =*/dspark_ctx.n_embd_cap,
-        /*.hadamard_rotations =*/&model.hadamard_rotations,
-        /*.hadamard_inverses  =*/&model.hadamard_inverses,
+        /*.hadamard_rotations =*/&hadamard_rotations,
+        /*.hadamard_inverses  =*/&hadamard_inverses,
         /*.samplers    =*/sampling.samplers,
         /*.n_outputs   =*/n_outputs,
         /*.cb          =*/graph_get_cb(),

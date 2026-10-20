@@ -1,0 +1,128 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index df82d3b15..b85b47a56 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -4036,6 +4036,7 @@ static bool ggml_vk_matmul_int_shmem_support(const vk_device& device, const std:
+     uint32_t block_a_size = 0;
+     switch (src0_type) {
+         case GGML_TYPE_Q2_0:    block_a_size = std430_size({{32, 4}, {fp_size,  fp_align}});                  break; // qs[8] + dm
++        case GGML_TYPE_PTQ1_0:  block_a_size = std430_size({{32, 4}, {fp_size,  fp_align}});                  break; // qs[8] + dm
+         case GGML_TYPE_Q4_0:    block_a_size = std430_size({{16, 4}, {fp_size,  fp_align}});                  break; // qs[16/4] + dm
+         case GGML_TYPE_Q4_1:    block_a_size = std430_size({{16, 4}, {fp2_size, fp2_align}});                 break; // qs[16/4] + dm(vec2)
+         case GGML_TYPE_Q5_0:    block_a_size = std430_size({{16, 4}, {4, 4}, {fp_size,  fp_align}});          break; // qs[16/4] + qh + dm
+@@ -4942,6 +4943,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+         if (device->integer_dot_product) {
+             CREATE_MMQ(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q2_0], matmul_q2_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
++            CREATE_MMQ(GGML_TYPE_PTQ1_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_PTQ1_0], matmul_ptq1_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
+             CREATE_MMQ(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_0], matmul_q4_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
+             CREATE_MMQ(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_1], matmul_q4_1_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
+             CREATE_MMQ(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q5_0], matmul_q5_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
+@@ -5125,6 +5127,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+         if (device->integer_dot_product) {
+             CREATE_MMQ(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q2_0].f32acc, matmul_q2_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
++            CREATE_MMQ(GGML_TYPE_PTQ1_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_PTQ1_0].f32acc, matmul_ptq1_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+             CREATE_MMQ(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_0].f32acc, matmul_q4_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+             CREATE_MMQ(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_1].f32acc, matmul_q4_1_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+             CREATE_MMQ(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q5_0].f32acc, matmul_q5_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_funcs.glsl
+index 24da4f715..61739537d 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_funcs.glsl
+@@ -40,6 +40,65 @@ ACC_TYPE mmq_dot_product(const uint ib_a) {
+ }
+ #endif
+ 
++#if defined(DATA_A_PTQ1_0)
++#include "ptq1_0.glsl"
++
++// dword view of the 28-byte (7-dword) PTQ1_0 blocks
++layout (binding = 0) readonly buffer A_PTQ1_0_U32 { uint32_t data_a_u32[]; };
++
++// PTQ1_0 (128 ternary weights per block, see ptq1_0.glsl for the element order): each 32-element unit ib is a
++// quarter block; iqs covers 4 consecutive elements. Trits (0..2) are stored in shared memory; the ternary -1
++// offset is applied with the q8_1 block sum, as for Q2_0: d_a * (sum_e t_e * q8_e * d_b - s_b).
++void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
++    const uint block_idx = ib >> 2u;
++    const uint e0 = ((ib & 3u) << 5u) + (iqs << 2u);
++
++    uint packed;
++    if (e0 < 120u) {
++        // qs regions: the 4 elements are one aligned dword (bytes e0 & 15, or 16 + ((e0 - 80) & 7)) at one level
++        const uint byte_off = e0 < 80u ? (e0 & 15u) : 16u + ((e0 - 80u) & 7u);
++        const uint n        = e0 < 80u ? (e0 >> 4u) : ((e0 - 80u) >> 3u);
++        const uint w  = data_a_u32[block_idx * 7u + (byte_off >> 2u)];
++        const uint p3 = POW3_MOD256[n];
++        // two bytes per 16-bit lane: v = b * 3^n mod 256, trit = (v * 3) >> 8
++        const uint lo = ((w & 0x00FF00FFu) * p3) & 0x00FF00FFu;
++        const uint hi = (((w >> 8u) & 0x00FF00FFu) * p3) & 0x00FF00FFu;
++        packed = (((lo * 3u) >> 8u) & 0x00FF00FFu) | ((((hi * 3u) >> 8u) & 0x00FF00FFu) << 8u);
++    } else {
++        // qh: elements 120 + 2n + h come from qh[h] at level n
++        packed = 0u;
++        [[unroll]] for (uint k = 0; k < 4; ++k) {
++            const uint t = e0 - 120u + k;
++            const uint b = uint(data_a[block_idx].qh[t & 1u]);
++            const uint v = (b * POW3_MOD256[t >> 1u]) & 0xFFu;
++            packed |= ((v * 3u) >> 8u) << (8u * k);
++        }
++    }
++    buf_a[buf_ib].qs[iqs] = int32_t(packed);
++
++    if (iqs == 0) {
++        buf_a[buf_ib].dm = FLOAT_TYPE(data_a[block_idx].d);
++    }
++}
++
++void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
++    cache_a[reg_ib].dm = buf_a[buf_ib].dm;
++
++    [[unroll]] for (uint iqs = 0; iqs < 8; ++iqs) {
++        cache_a[reg_ib].qs[iqs] = buf_a[buf_ib].qs[iqs];
++    }
++}
++
++ACC_TYPE mmq_dot_product(const uint ib_a) {
++    int32_t q_sum = 0;
++    [[unroll]] for (uint iqs = 0; iqs < 8; ++iqs) {
++        q_sum += dotPacked4x8EXT(cache_a[ib_a].qs[iqs], cache_b.qs[iqs]);
++    }
++
++    return ACC_TYPE(float(cache_a[ib_a].dm) * (float(q_sum) * float(cache_b.ds.x) - float(cache_b.ds.y)));
++}
++#endif
++
+ #if defined(DATA_A_Q4_0) || defined(DATA_A_Q4_1)
+ // 2-byte loads for Q4_0 blocks (18 bytes)
+ // 4-byte loads for Q4_1 blocks (20 bytes)
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_shmem_types.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_shmem_types.glsl
+index 2b7adcb6c..fc8e54a98 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_shmem_types.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_shmem_types.glsl
+@@ -13,6 +13,12 @@ struct block_a_cache {
+     uint32_t qs[16/4];
+     FLOAT_TYPE dm;
+ };
++#elif defined(DATA_A_PTQ1_0)
++#define QUANT_R_MMQ 1
++struct block_a_cache {
++    int32_t qs[8];
++    FLOAT_TYPE dm;
++};
+ #elif defined(DATA_A_Q2_0)
+ #define QUANT_R_MMQ 1
+ struct block_a_cache {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 85544570a..7e68980e2 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -629,7 +629,7 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
+ 
+ #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+         // Integer dot mmq performs better with f32 accumulators (different shader, skip for dot2)
+-        if (!f16acc && !coopmat && !coopmat2 && !dot2 && (is_legacy_quant(tname) || is_k_quant(tname) || tname == "mxfp4")) {
++        if (!f16acc && !coopmat && !coopmat2 && !dot2 && (is_legacy_quant(tname) || is_k_quant(tname) || tname == "mxfp4" || tname == "ptq1_0")) {
+             string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"},}), fp16, coopmat, coopmat2, f16acc);
+         }
+ #endif

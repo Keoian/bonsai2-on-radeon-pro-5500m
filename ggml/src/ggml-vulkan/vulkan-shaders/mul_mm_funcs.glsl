@@ -17,6 +17,11 @@ void store_a(uint m, uint k_pair, FLOAT_TYPEV2 value) {
     buf_a[a_shmem_index(m, k_pair)] = value;
 }
 
+#if defined(DATA_A_PTQ1_0)
+// dword view of the 28-byte (7-dword) PTQ1_0 blocks
+layout (binding = 0) readonly buffer A_PTQ1_0_U32 { uint data_a_ptq1_0_u32[]; };
+#endif
+
 void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uint idx_m, const uint block, const uint end_k) {
 #if defined(DATA_A_F32) || defined(DATA_A_F16)
 #if LOAD_VEC_A == 8
@@ -162,10 +167,25 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const float d = float(data_a[ib].d);
 
             const uint k_pair = row * LOAD_VEC_A / 2;
-            [[unroll]] for (uint l = 0; l < 4; ++l) {
-                store_a(col, k_pair + l, FLOAT_TYPEV2(
-                    ptq1_0_trit(ib, 0u, e0 + 2u*l)      * d,
-                    ptq1_0_trit(ib, 0u, e0 + 2u*l + 1u) * d));
+            if (grp < 15u) {
+                // groups 0..14: the 8 elements are two aligned dwords of qs at one trit level
+                // (bytes e0 & 15 at level e0 / 16 for e0 < 80, bytes 16..23 at level (e0 - 80) / 8 after)
+                const uint byte_off = grp < 10u ? (e0 & 15u) : 16u;
+                const uint p3 = POW3_MOD256[grp < 10u ? (e0 >> 4u) : ((e0 - 80u) >> 3u)];
+                [[unroll]] for (uint h = 0; h < 2; ++h) {
+                    const uint w  = data_a_ptq1_0_u32[ib * 7u + (byte_off >> 2u) + h];
+                    // two bytes per 16-bit lane: v = b * 3^n mod 256, trit = (v * 3) >> 8
+                    const uint lo = ((((w & 0x00FF00FFu) * p3) & 0x00FF00FFu) * 3u >> 8u) & 0x00FF00FFu;
+                    const uint hi = (((((w >> 8u) & 0x00FF00FFu) * p3) & 0x00FF00FFu) * 3u >> 8u) & 0x00FF00FFu;
+                    store_a(col, k_pair + 2u*h,      FLOAT_TYPEV2(float(int(lo & 0xFFu) - 1) * d, float(int(hi & 0xFFu) - 1) * d));
+                    store_a(col, k_pair + 2u*h + 1u, FLOAT_TYPEV2(float(int(lo >> 16u) - 1) * d, float(int(hi >> 16u) - 1) * d));
+                }
+            } else {
+                [[unroll]] for (uint l = 0; l < 4; ++l) {
+                    store_a(col, k_pair + l, FLOAT_TYPEV2(
+                        ptq1_0_trit(ib, 0u, e0 + 2u*l)      * d,
+                        ptq1_0_trit(ib, 0u, e0 + 2u*l + 1u) * d));
+                }
             }
 #elif defined(DATA_A_Q1_0)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
