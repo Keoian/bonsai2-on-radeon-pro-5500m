@@ -16866,8 +16866,9 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
     auto const &mm_add_ok = [&](const ggml_tensor *mul, const ggml_tensor *add) {
         const ggml_tensor *bias = add->src[0] == mul ? add->src[1] : add->src[0];
 
-        // mat-vec only
-        if (ggml_nrows(mul) != 1) {
+        // mat-vec only: one column, or up to mul_mat_vec_max_cols columns of a single matrix (the bias then has the
+        // destination's column stride, which the mat-vec shaders index it by)
+        if (ggml_nrows(mul) != 1 && (mul->ne[1] > mul_mat_vec_max_cols || mul->ne[2] * mul->ne[3] != 1)) {
             return false;
         }
         // shaders assume the types match

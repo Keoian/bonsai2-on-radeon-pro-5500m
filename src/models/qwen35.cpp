@@ -880,6 +880,15 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     cb(cur, "mtp_attn_pregate", il);
 
+    // masked readers take only the output rows of h_nextn: the other rows (catch-up rows decoded with the first draft
+    // row) are there for their K/V, so the gate, output projection, FFN and head run on the output rows alone
+    const bool out_rows_only = cparams.embeddings_nextn_masked && (int64_t) n_outputs < n_tokens;
+    if (out_rows_only) {
+        cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
+        gate  = ggml_get_rows(ctx0, gate,  inp_out_ids);
+        inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+    }
+
     cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
     cur = build_lora_mm(layer.wo, cur, layer.wo_s);
     cb(cur, "mtp_attn_out", il);
@@ -915,7 +924,9 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     // Matters as soon as an MTP batch has more tokens than outputs, e.g. catch-up rows decoded
     // together with the first draft row.
     if (cparams.embeddings_nextn_masked) {
-        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        if (!out_rows_only) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
         res->t_h_nextn = cur;
     } else {
         res->t_h_nextn = cur;
