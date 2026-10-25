@@ -304,13 +304,26 @@ static int32_t common_sampler_fast_topk(const common_params_sampling & params, b
         return 0;
     }
 
+    // penalties that only lower logits change at most penalty_last_n tokens, so the k largest after them are among the
+    // k + penalty_last_n largest before them; the penalties and top-k then run on those as on the whole vocabulary
+    static const bool prefilter_penalties = [] {
+        const char * e = getenv("LLAMA_SAMPLER_PREFILTER_PENALTIES");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    int32_t extra = 0;
+
     for (const auto cnstr : params.samplers) {
         switch (cnstr) {
             case COMMON_SAMPLER_TYPE_TOP_K:
-                return params.top_k;
+                return params.top_k + extra;
             case COMMON_SAMPLER_TYPE_PENALTIES:
                 if (params.penalty_last_n != 0 && (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f)) {
-                    return 0;
+                    const bool lowers = prefilter_penalties && extra == 0 && params.penalty_last_n > 0 && params.penalty_last_n <= 128 &&
+                        params.penalty_repeat >= 1.0f && params.penalty_freq >= 0.0f && params.penalty_present >= 0.0f;
+                    if (!lowers) {
+                        return 0;
+                    }
+                    extra = params.penalty_last_n;
                 }
                 break;
             case COMMON_SAMPLER_TYPE_DRY:
