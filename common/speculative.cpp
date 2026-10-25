@@ -32,6 +32,7 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <random>
 
 // ARC-LAB: lab knobs from GGML_SYCL_KNOBS_FILE (lines NAME=V, re-read when the file changes) so one server can A/B
 // speculative settings: LAB_SPEC_DRAFT_N_MAX caps the MTP draft below --spec-draft-n-max, LAB_SPEC_NGRAM_START replaces
@@ -2284,12 +2285,45 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
+// draw a draft token from candidates sorted by logit, at temperature temp within the top-p set; q receives the distribution it was drawn from
+static llama_token common_speculative_sample_draft(const llama_token_data_array * cur_p, float temp, float top_p, std::mt19937 & rng, std::vector<llama_token_data> & q) {
+    q.assign(cur_p->data, cur_p->data + cur_p->size);
+    const float l0 = q[0].logit;
+    double sum = 0.0;
+    for (auto & c : q) {
+        c.p = expf((c.logit - l0) / temp);
+        sum += c.p;
+    }
+    size_t n = 0;
+    double cum = 0.0;
+    while (n < q.size() && (n == 0 || cum < top_p * sum)) {
+        cum += q[n++].p;
+    }
+    q.resize(n);
+    for (auto & c : q) {
+        c.p = (float) (c.p / cum);
+    }
+    const double u = std::uniform_real_distribution<double>(0.0, 1.0)(rng);
+    double acc = 0.0;
+    size_t k = 0;
+    for (; k + 1 < q.size(); ++k) {
+        acc += q[k].p;
+        if (u < acc) {
+            break;
+        }
+    }
+    return q[k].id;
+}
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
     llama_batch batch;
 
     std::vector<common_sampler_ptr> smpls;
+
+    // for sampled drafts (dp.sample_temp > 0), reseeded per request so the drafts do not depend on earlier requests
+    std::vector<std::mt19937> sample_rngs;
 
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
@@ -2410,6 +2444,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
+        sample_rngs.resize(n_seq);
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
@@ -2582,6 +2617,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            sample_rngs[seq_id].seed(0x5eed + seq_id);
+        }
         if (FILE * lf = common_mtp_draft_log()) {
             fprintf(lf, "{\"begin\": %zu, \"seq\": %d}\n", prompt.size(), (int) seq_id);
             fflush(lf);
@@ -2900,6 +2938,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
+            dp.dists.clear();
 
             // catch-up rows ride in the same decode as the first draft row (no logits)
             auto & d = deferred[seq_id];
@@ -2998,7 +3037,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     fprintf(lf, "], \"stop\": %d}\n", cur_p->data[0].p < params.p_min ? 1 : 0);
                 }
                 // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                llama_token id = cur_p->data[0].id;
 
                 if (id < 0 || id >= llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)))) {
                     SPC_ERR("draft candidate id %d out of vocab (seq_id=%d, step=%d, i_last=%d, cur_p.size=%zu) - dropping draft\n",
@@ -3016,9 +3055,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
+                auto & dp = dparams.at(seq_id);
+
+                if (dp.sample_temp > 0.0f) {
+                    id = common_speculative_sample_draft(cur_p, dp.sample_temp, dp.sample_top_p, sample_rngs[seq_id], dp.dists.emplace_back());
+                }
+
                 common_sampler_accept(smpl, id, true);
 
-                auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
                 result.push_back(id);

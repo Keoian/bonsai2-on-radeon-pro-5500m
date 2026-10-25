@@ -64,6 +64,13 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // > 0: the MTP draft samples at the target's temperature and top-p instead of taking the argmax
+    // dists then holds the distribution of each drafted token, for common_sampler_sample_and_accept_n_dist
+    float sample_temp  = 0.0f;
+    float sample_top_p = 1.0f;
+
+    std::vector<std::vector<llama_token_data>> dists = {};
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

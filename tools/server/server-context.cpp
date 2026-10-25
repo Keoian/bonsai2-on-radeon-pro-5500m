@@ -213,6 +213,7 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    std::mt19937 spec_dist_rng; // accept/reject draws of the speculative-sampling rule
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -1729,6 +1730,7 @@ private:
         if (task.need_sampling()) {
             try {
                 slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+                slot.spec_dist_rng.seed(common_sampler_get_seed(slot.smpl.get()) ^ 0x9e3779b9u);
             } catch (std::exception & e) {
                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
                 send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
@@ -2954,13 +2956,21 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        // sample the draft like the target when its chain ends in a plain dist draw (LLAMA_SPEC_SAMPLE_DRAFT=0: greedy drafts)
+                        static const bool sample_drafts = !getenv("LLAMA_SPEC_SAMPLE_DRAFT") || atoi(getenv("LLAMA_SPEC_SAMPLE_DRAFT")) != 0;
+                        const auto & sp = slot.task->params.sampling;
+                        const bool sample_draft = sample_drafts && sp.temp > 0.0f && sp.mirostat == 0 && !sp.backend_sampling &&
+                            std::find(sp.samplers.begin(), sp.samplers.end(), COMMON_SAMPLER_TYPE_ADAPTIVE_P) == sp.samplers.end();
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
-                            /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
-                            /* .n_past   = */ slot.prompt.n_tokens(),
-                            /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
-                            /* .result   = */ &slot.spec_draft,
+                            /* .drafting     = */ true,
+                            /* .n_max        = */ n_draft_max,
+                            /* .n_past       = */ slot.prompt.n_tokens(),
+                            /* .id_last      = */ slot.sampled,
+                            /* .prompt       = */ &slot.spec_prompt,
+                            /* .result       = */ &slot.spec_draft,
+                            /* .sample_temp  = */ sample_draft ? sp.temp : 0.0f,
+                            /* .sample_top_p = */ sample_draft ? sp.top_p : 1.0f,
                         };
 
                         drafting.push_back(&slot);
@@ -3852,7 +3862,11 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                // a replay re-verifies tokens that are already decided, with the target's own samples
+                const auto & dists = common_speculative_get_draft_params(spec.get(), slot.id).dists;
+                auto accepted = !slot.spec_is_replay && dists.size() >= n_draft
+                    ? common_sampler_sample_and_accept_n_dist(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, dists, slot.spec_dist_rng)
+                    : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
