@@ -1195,6 +1195,11 @@ private:
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+                if (params_base.speculative.accept.approx()) {
+                    SRV_WRN("speculative accept rule '%s' by default (approximate: drafts the model would not have sampled "
+                            "are kept; requests can set \"speculative.accept\": \"exact\")\n",
+                            common_spec_accept_to_str(params_base.speculative.accept).c_str());
+                }
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
             }
@@ -2973,6 +2978,30 @@ private:
                             /* .sample_top_p = */ sample_draft ? sp.top_p : 1.0f,
                         };
 
+                        // an approximate accept rule: the draft samples with the request's other settings too. With a presence
+                        // penalty it needs the target's penalty window (the slot's last text tokens, then id_last, which the
+                        // verify puts at the first row). Media positions read as LLAMA_TOKEN_NULL and are skipped, as the
+                        // penalty sampler never saw them
+                        auto & dpr = common_speculative_get_draft_params(spec.get(), slot.id);
+                        dpr.accept_approx = sample_draft && slot.task->params.speculative.accept.approx();
+                        if (dpr.accept_approx) {
+                            dpr.target_top_k      = sp.top_k;
+                            dpr.target_min_p      = sp.min_p;
+                            dpr.target_present    = sp.penalty_present;
+                            dpr.target_pen_last_n = sp.penalty_last_n;
+                            if (sp.penalty_present != 0.0f && sp.penalty_last_n != 0) {
+                                const int32_t n = sp.penalty_last_n > 0 ? sp.penalty_last_n : 1024;
+                                dpr.pen_window.push_back(slot.sampled);
+                                for (int32_t k = (int32_t) slot.prompt.tokens.size() - 1; k >= 0 && (int32_t) dpr.pen_window.size() < n; --k) {
+                                    const llama_token t = slot.prompt.tokens[k];
+                                    if (t != LLAMA_TOKEN_NULL) {
+                                        dpr.pen_window.push_back(t);
+                                    }
+                                }
+                                std::reverse(dpr.pen_window.begin(), dpr.pen_window.end());
+                            }
+                        }
+
                         drafting.push_back(&slot);
                     }
                 }
@@ -3869,7 +3898,8 @@ private:
                 // a replay re-verifies tokens that are already decided, with the target's own samples
                 const auto & dists = common_speculative_get_draft_params(spec.get(), slot.id).dists;
                 auto accepted = !slot.spec_is_replay && dists.size() >= n_draft
-                    ? common_sampler_sample_and_accept_n_dist(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, dists, slot.spec_dist_rng)
+                    ? common_sampler_sample_and_accept_n_dist(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, dists, slot.spec_dist_rng,
+                            slot.task->params.speculative.accept)
                     : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 slot.spec_i_batch.clear();
 

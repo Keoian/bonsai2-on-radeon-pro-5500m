@@ -121,6 +121,19 @@ At a temperature above 0 the head samples its guess at the request's temperature
 accepts it with the speculative-sampling rule (min(1, p/q)), which accepts more drafts than matching the
 argmax. `LLAMA_SPEC_SAMPLE_DRAFT=0` turns that off.
 
+`-Accept escape` (or `"speculative.accept": "escape"` per request, or the chat UI's "Draft acceptance" setting) is
+faster but **approximate**: it keeps a draft unless the model's own sampler could never pick it there (probability 0
+after penalties, top-k, top-p and min-p), so the output is no longer distributed exactly as without MTP. Port of
+dual-p100-qwen-3-8-27b 09a243185, where quality matched exact on that repo's code, math and thinking evals.
+`esc+<x>` also vetoes drafts below x times the top token's probability. Same 6 prompts and seeds, rules alternated:
+
+| Preset | exact | escape |
+|---|---|---|
+| thinking (1.0 / 0.95 / top-k 20 / min-p 0.05) | 18.92 tok/s, 73.6% accepted | 19.88 tok/s, 89.3% accepted |
+| thinking off (0.7 / 0.8 / top-k 20 / presence 1.5) | 16.90 tok/s, 73.5% | 17.47 tok/s, 86.1% |
+
+The gain is smaller than on the P100 (+14-31%) because a step here drafts one token, so it can win at most 2.
+
 The head, its KV cache and the delta-net rollback state take about 1 GB of VRAM, so the context drops from 64k
 to 48k (52k is the most that fits). A Q8_0 head draws the same tokens and fits 40k. Drafting two tokens per
 step is slower on this card (14.9 vs 18.0 tok/s): the ternary mat-vec decodes the weights once per 2 columns,

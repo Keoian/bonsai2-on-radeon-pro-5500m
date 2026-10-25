@@ -11,6 +11,7 @@
   .\start-server.ps1 -Parallel 2    # more concurrent chats (each slot costs VRAM; 1 fits the 8 GB 5500M)
   .\start-server.ps1 -Ctx 16384 -NoVision -- --reasoning-budget 2048   # extra llama-server flags after --
   .\start-server.ps1 -Mtp            # MTP speculative decoding: +20-35% decode, 48k context (run graft-mtp.py once first)
+  .\start-server.ps1 -Mtp -Accept escape   # also keep drafts the model could have sampled (approximate, faster)
 
   .\start-server.ps1 -ModelDir D:\models   # where the .gguf files live (see below)
 
@@ -30,6 +31,9 @@ param(
     # MTP head from ProCreations/Ternary-Bonsai-2-27B-MTP (graft-mtp.py builds the file). The head, its KV cache
     # and the GDN rollback state cost ~1 GB of VRAM, so the default context drops to 48k (40k with a Q8_0 head).
     [switch] $Mtp,
+    # With -Mtp: the default draft accept rule. exact keeps the model's output distribution; escape (approximate) also
+    # keeps drafts the model could have sampled but did not. Requests and the chat UI can override it.
+    [string] $Accept,
     [int]    $Ctx = 65536,
     # KV cache precision. On the 8 GB 5500M at 32k: q8_0/q8_0 fits but decode drops to ~9 tok/s (VRAM
     # nearly full); q8_0 keys + q4_0 values keeps ~14 tok/s. Keys are the precision-sensitive half.
@@ -90,6 +94,7 @@ if ($Mtp) {
     # cache the target's types (it is f16 otherwise), and a 128-row draft batch cuts its compute buffer from 130 to 35 MB.
     $Args_ += @("--spec-type", "draft-mtp", "--spec-draft-n-max", "1", "-ctkd", $CacheK, "-ctvd", $CacheV)
     if (-not $env:LLAMA_ARG_SPEC_DRAFT_UBATCH) { $env:LLAMA_ARG_SPEC_DRAFT_UBATCH = "128" }
+    if ($Accept) { $Args_ += @("--spec-accept", $Accept) }
 }
 if (-not $NoVision) {
     $Mmproj = Join-Path $Models "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf"
@@ -117,7 +122,7 @@ Write-Host "=== Bonsai 2 27B / llama-server ===" -ForegroundColor Green
 Write-Host "  Model:   $Gguf"
 Write-Host ("  Backend: " + $(if ($Ngl -gt 0) { "Vulkan, -ngl $Ngl" + $(if ($Radeon) { ", device $($Radeon.Matches[0].Groups[1].Value)" } else { "" }) } else { "CPU" }))
 Write-Host "  Context: $Ctx (KV cache K=$CacheK V=$CacheV)"
-if ($Mtp) { Write-Host "  Spec:    MTP, 1 draft token per step" }
+if ($Mtp) { Write-Host ("  Spec:    MTP, 1 draft token per step, accept rule " + $(if ($Accept) { $Accept } else { "exact" })) }
 Write-Host ("  UI:      http://localhost:$Port" + $(if ($Lan) { "  (LAN: http://$((Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.*' } | Select-Object -First 1).IPAddress):$Port)" } else { "" }))
 Write-Host "  API:     http://localhost:$Port/v1/chat/completions"
 Write-Host "  Ctrl+C stops the server."

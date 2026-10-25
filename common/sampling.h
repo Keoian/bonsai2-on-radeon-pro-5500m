@@ -92,8 +92,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // verify sampled drafts with the speculative-sampling rule; dists[i] is the distribution draft[i] was drawn from
 // draft[i] is accepted with probability min(1, p/q), else a token is drawn from max(p - q, 0), so every returned token has the chain's distribution
 // grammar positions use the plain rule (accept if the chain's own sample matches)
+// acc: how drafts are accepted (exact by default; the other rules are approximate), see sampling.cpp
 std::vector<llama_token> common_sampler_sample_and_accept_n_dist(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft,
-        const std::vector<std::vector<llama_token_data>> & dists, std::mt19937 & rng);
+        const std::vector<std::vector<llama_token_data>> & dists, std::mt19937 & rng, const common_spec_accept & acc = {});
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 

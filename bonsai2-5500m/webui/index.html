@@ -154,6 +154,12 @@
     <input id="presence" type="number" step="0.1" min="0" max="2">
     <label>Max reply tokens (-1 = unlimited)</label>
     <input id="maxTokens" type="number" step="256" min="-1">
+    <label>Draft acceptance (MTP server)</label>
+    <select id="specAccept">
+      <option value="">Server default</option>
+      <option value="exact">Exact: same output as without MTP</option>
+      <option value="escape">Escape: faster, approximate</option>
+    </select>
 
     <h2>System prompt</h2>
     <textarea id="systemPrompt" placeholder="(optional)"></textarea>
@@ -190,7 +196,7 @@
   const els = {
     status: $('status'), messages: $('messages'), chat: $('chat'), input: $('input'), send: $('send'),
     settings: $('settings'), serverUrl: $('serverUrl'), serverInfo: $('serverInfo'), reasoning: $('reasoning'),
-    effort: $('effort'), temp: $('temp'), topP: $('topP'), topK: $('topK'), minP: $('minP'), presence: $('presence'), maxTokens: $('maxTokens'),
+    effort: $('effort'), temp: $('temp'), topP: $('topP'), topK: $('topK'), minP: $('minP'), presence: $('presence'), maxTokens: $('maxTokens'), specAccept: $('specAccept'),
     systemPrompt: $('systemPrompt'), theme: $('theme'), attachBtn: $('attachBtn'), fileInput: $('fileInput'),
     attachRow: $('attachRow'), attachPreview: $('attachPreview'), attachName: $('attachName'), attachClear: $('attachClear'),
   };
@@ -204,7 +210,7 @@
   const defaultServer = (location.protocol === 'http:' || location.protocol === 'https:') ? location.origin : 'http://localhost:8080';
   const settings = Object.assign({
     serverUrl: defaultServer, reasoning: '2048', effort: 'medium', temp: 1.0, topP: 0.95, topK: 20, minP: 0.05, presence: 0,
-    maxTokens: -1, systemPrompt: '', theme: '',
+    maxTokens: -1, specAccept: '', systemPrompt: '', theme: '',
   }, store.get('bonsai.settings', {}));
 
   const PRESET_THINK   = { temp: 1.0, topP: 0.95, topK: 20, minP: 0.05, presence: 0 };
@@ -213,7 +219,7 @@
   function applySettingsToForm() {
     els.serverUrl.value = settings.serverUrl; els.reasoning.value = settings.reasoning; els.effort.value = settings.effort;
     els.temp.value = settings.temp; els.topP.value = settings.topP; els.topK.value = settings.topK; els.minP.value = settings.minP;
-    els.presence.value = settings.presence; els.maxTokens.value = settings.maxTokens;
+    els.presence.value = settings.presence; els.maxTokens.value = settings.maxTokens; els.specAccept.value = settings.specAccept;
     els.systemPrompt.value = settings.systemPrompt; els.theme.value = settings.theme;
     document.documentElement.dataset.theme = settings.theme;
   }
@@ -222,7 +228,7 @@
     settings.reasoning = els.reasoning.value; settings.effort = els.effort.value;
     settings.temp = parseFloat(els.temp.value); settings.topP = parseFloat(els.topP.value);
     settings.topK = parseInt(els.topK.value, 10); settings.minP = parseFloat(els.minP.value); settings.presence = parseFloat(els.presence.value);
-    settings.maxTokens = parseInt(els.maxTokens.value, 10);
+    settings.maxTokens = parseInt(els.maxTokens.value, 10); settings.specAccept = els.specAccept.value;
     settings.systemPrompt = els.systemPrompt.value; settings.theme = els.theme.value;
     document.documentElement.dataset.theme = settings.theme;
     store.set('bonsai.settings', settings);
@@ -409,6 +415,7 @@
       thinking_budget_tokens: parseInt(settings.reasoning, 10),
     };
     if (settings.maxTokens > 0) body.max_tokens = settings.maxTokens;
+    if (settings.specAccept) body['speculative.accept'] = settings.specAccept;
     body.chat_template_kwargs = settings.reasoning === '0' ? { enable_thinking: false } : { reasoning_effort: settings.effort };
 
     const refresh = () => {

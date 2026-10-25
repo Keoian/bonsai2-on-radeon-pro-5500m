@@ -377,8 +377,27 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
 
+// how the target accepts sampled drafts (--spec-accept, per request "speculative.accept"). Every rule but exact is
+// APPROXIMATE: the output is no longer distributed as the target's own sampling (common_sampler_sample_and_accept_n_dist)
+enum common_spec_accept_kind {
+    COMMON_SPEC_ACCEPT_EXACT,   // the speculative-sampling rule (default)
+    COMMON_SPEC_ACCEPT_ESCAPE,  // keep a drafted token unless the target's own sampler could never emit it there
+    COMMON_SPEC_ACCEPT_LAM,     // veto when the target's raw probability of the token is below lam x its top token's
+    COMMON_SPEC_ACCEPT_ESC_LAM, // veto on either test
+    COMMON_SPEC_ACCEPT_ALL,     // never veto (research only: measured broken)
+};
+
+struct common_spec_accept {
+    common_spec_accept_kind kind = COMMON_SPEC_ACCEPT_EXACT;
+    float                   lam  = 0.0f; // LAM, ESC_LAM: in (0, 1)
+
+    bool approx() const { return kind != COMMON_SPEC_ACCEPT_EXACT; }
+};
+
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
+
+    common_spec_accept accept; // see common_spec_accept_from_str
 
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
