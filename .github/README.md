@@ -98,6 +98,27 @@ A 21,500-token recall test also passed with the default: the model found a code 
 
 For full-precision cache use `-CacheK f16 -CacheV f16 -Ctx 16384`. On a card with more VRAM, raise `-Ctx`.
 
+### MTP speculative decoding
+
+`-Mtp` adds a one-layer draft head (multi-token prediction) that guesses the next token. The full model checks
+the guess in the same pass, so the output is the same as without it. Build the model file once. The script
+downloads only the 430 MiB head of [ProCreations/Ternary-Bonsai-2-27B-MTP](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-MTP)
+and copies the rest from your PTQ1_0 file, then requantizes the head to Q4_K (`--head-type q8_0` keeps it as is):
+
+```
+python bonsai2-5500m\graft-mtp.py
+.\bonsai2-5500m\start-server.ps1 -Mtp          # 48k context
+```
+
+| Server decode, 3 prompts, 128-256 tokens | No MTP | MTP |
+|---|---|---|
+| greedy | 14.2-14.6 tok/s | 16.8-19.7 tok/s, 70-96% of drafts accepted |
+| temperature 1.0 (model card) | 14.1-14.2 tok/s | 16.0-19.9 tok/s, 63-97% accepted |
+
+The head, its KV cache and the delta-net rollback state take about 1 GB of VRAM, so the context drops from 64k
+to 48k (52k is the most that fits). A Q8_0 head draws the same tokens and fits 40k. Drafting two tokens per
+step was slower: the second draft is accepted less often than it costs.
+
 `-Lan` exposes an unauthenticated API. Only use it on a network you trust, or add `-- --api-key <key>`.
 
 ## Chat UI

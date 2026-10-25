@@ -10,6 +10,7 @@
   .\start-server.ps1 -Cpu            # CPU only (PQ2_0), for machines without a usable GPU
   .\start-server.ps1 -Parallel 2    # more concurrent chats (each slot costs VRAM; 1 fits the 8 GB 5500M)
   .\start-server.ps1 -Ctx 16384 -NoVision -- --reasoning-budget 2048   # extra llama-server flags after --
+  .\start-server.ps1 -Mtp            # MTP speculative decoding: +20-35% decode, 48k context (run graft-mtp.py once first)
 
   .\start-server.ps1 -ModelDir D:\models   # where the .gguf files live (see below)
 
@@ -26,6 +27,9 @@ param(
     [switch] $Cpu,
     [switch] $NoVision,
     [switch] $MmprojGpu,
+    # MTP head from ProCreations/Ternary-Bonsai-2-27B-MTP (graft-mtp.py builds the file). The head, its KV cache
+    # and the GDN rollback state cost ~1 GB of VRAM, so the default context drops to 48k (40k with a Q8_0 head).
+    [switch] $Mtp,
     [int]    $Ctx = 65536,
     # KV cache precision. On the 8 GB 5500M at 32k: q8_0/q8_0 fits but decode drops to ~9 tok/s (VRAM
     # nearly full); q8_0 keys + q4_0 values keeps ~14 tok/s. Keys are the precision-sensitive half.
@@ -54,6 +58,14 @@ if (-not $Models) { throw "no Bonsai 2 .gguf found. Looked in: $($Candidates -jo
 
 if ($Cpu) { $Model = "pq2"; $Ngl = 0 }
 $Gguf = if ($Model -eq "pq2") { "Ternary-Bonsai-2-27B-PQ2_0.gguf" } else { "Ternary-Bonsai-2-27B-PTQ1_0.gguf" }
+if ($Mtp) {
+    if ($Model -ne "ptq1") { throw "-Mtp needs the PTQ1_0 model on the GPU" }
+    $MtpGguf = "Ternary-Bonsai-2-27B-PTQ1_0-MTP-Q4_K.gguf", "Ternary-Bonsai-2-27B-PTQ1_0-MTP-Q8_0.gguf" |
+        Where-Object { Test-Path (Join-Path $Models $_) } | Select-Object -First 1
+    if (-not $MtpGguf) { throw "no MTP model in $Models. Build it once with: python $(Join-Path $PSScriptRoot 'graft-mtp.py')" }
+    $Gguf = $MtpGguf
+    if (-not $PSBoundParameters.ContainsKey("Ctx")) { $Ctx = if ($Gguf -like "*Q4_K*") { 49152 } else { 40960 } }
+}
 $GgufPath = Join-Path $Models $Gguf
 if (-not (Test-Path $GgufPath)) { throw "model not found: $GgufPath" }
 
@@ -73,6 +85,12 @@ $Args_ = @(
     "--slots"
 )
 if ($Cpu) { $Args_ += @("-t", [Math]::Max(1, [Environment]::ProcessorCount / 2)) }
+if ($Mtp) {
+    # One draft token per step: depth 2 accepts less and costs a second draft decode. -ctkd/-ctvd give the draft KV
+    # cache the target's types (it is f16 otherwise), and a 128-row draft batch cuts its compute buffer from 130 to 35 MB.
+    $Args_ += @("--spec-type", "draft-mtp", "--spec-draft-n-max", "1", "-ctkd", $CacheK, "-ctvd", $CacheV)
+    if (-not $env:LLAMA_ARG_SPEC_DRAFT_UBATCH) { $env:LLAMA_ARG_SPEC_DRAFT_UBATCH = "128" }
+}
 if (-not $NoVision) {
     $Mmproj = Join-Path $Models "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf"
     if (Test-Path $Mmproj) {
@@ -99,6 +117,7 @@ Write-Host "=== Bonsai 2 27B / llama-server ===" -ForegroundColor Green
 Write-Host "  Model:   $Gguf"
 Write-Host ("  Backend: " + $(if ($Ngl -gt 0) { "Vulkan, -ngl $Ngl" + $(if ($Radeon) { ", device $($Radeon.Matches[0].Groups[1].Value)" } else { "" }) } else { "CPU" }))
 Write-Host "  Context: $Ctx (KV cache K=$CacheK V=$CacheV)"
+if ($Mtp) { Write-Host "  Spec:    MTP, 1 draft token per step" }
 Write-Host ("  UI:      http://localhost:$Port" + $(if ($Lan) { "  (LAN: http://$((Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.*' } | Select-Object -First 1).IPAddress):$Port)" } else { "" }))
 Write-Host "  API:     http://localhost:$Port/v1/chat/completions"
 Write-Host "  Ctrl+C stops the server."
