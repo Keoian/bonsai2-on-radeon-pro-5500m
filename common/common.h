@@ -321,13 +321,23 @@ struct common_params_model {
     }
 };
 
+// default MTP draft depth when the target runs on CUDA: there the verify cost grows faster with depth than on Metal
+#define COMMON_SPEC_MTP_N_MAX_CUDA 2
+
 // draft-model-based speculative decoding parameters
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
+    bool    n_max_set = false; // set by --spec-draft-n-max; if false, MTP on CUDA uses COMMON_SPEC_MTP_N_MAX_CUDA
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
+
+    // stop drafting once the sequence is this long (0 = never). Deep in the context a step is bound
+    // by reading the KV cache, and the draft passes plus the multi-column verify add to that read
+    // without shortening it: on a 4070 with Bonsai 2 27B the draft is +85% at zero depth, breaks
+    // even near 24k tokens and costs 30% at 64k. Past the cutoff the slot decodes one token per step.
+    int32_t n_depth_max = 0;
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
@@ -637,6 +647,12 @@ struct common_params {
     bool force_pure_content_parser = false;
     common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     int enable_reasoning = -1; // -1 = auto, 0 = disable, 1 = enable
+
+    // server: reasoning_effort words passed to the chat template (empty = any); others become the fallback
+    std::vector<std::string> reasoning_effort_allow;
+    std::string              reasoning_effort_fallback = "medium";
+    // server: with thinking on, raise a client output cap below this (0 = off)
+    int32_t reasoning_max_tokens_floor = 0;
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
 

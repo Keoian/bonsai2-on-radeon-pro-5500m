@@ -92,6 +92,29 @@ cmake --build build --config Release
   - **Fedora / RHEL / Rocky / Alma:** `sudo dnf install openssl-devel`
   - **Arch / Manjaro:** `sudo pacman -S openssl`
 
+### x86 CPU instruction sets
+
+To build for x86-64 CPUs with SSSE3 and no AVX requirement, use a fresh build directory:
+
+```bash
+cmake -B build-ssse3 -DGGML_NATIVE=OFF -DGGML_SSSE3=ON \
+    -DGGML_SSE42=OFF -DGGML_AVX=OFF -DGGML_AVX2=OFF \
+    -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_BMI2=OFF
+cmake --build build-ssse3 --config Release -j 8
+```
+
+SSSE3 is a separate extension from SSE3. Set `GGML_SSSE3=OFF` in this configuration for the x86-64 SSE2 baseline. Avoid `-march=native` in custom compiler flags when targeting older CPUs.
+
+For automatic selection at startup, build the CPU variants as shared backends:
+
+```bash
+cmake -B build-auto -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=ON \
+    -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON
+cmake --build build-auto --config Release -j 8
+```
+
+On x86-64, this includes SSE2, SSSE3, SSE4.2, and AVX-family variants. Keep the backend libraries with the executable when distributing the build; the loader selects the highest-ranked variant supported by the CPU.
+
 ## BLAS Build
 
 Building the program with BLAS support may lead to some performance improvements in prompt processing using batch sizes higher than 32 (the default is 512). Using BLAS doesn't affect the generation performance. There are currently several different BLAS implementations available for build and use:
@@ -300,7 +323,8 @@ The following compilation options are also available to tweak performance:
 | GGML_CUDA_FORCE_MMQ           | Boolean                | false   | Force the use of custom matrix multiplication kernels for quantized models instead of FP16 cuBLAS even if there is no int8 tensor core implementation available (affects V100, CDNA and RDNA3+). MMQ kernels are enabled by default on GPUs with int8 tensor core support. With MMQ force enabled, speed for large batch sizes will be worse but VRAM consumption will be lower. |
 | GGML_CUDA_FORCE_CUBLAS        | Boolean                | false   | Force the use of FP16 cuBLAS instead of custom matrix multiplication kernels for quantized models. There may be issues with numerical overflows (except for V100, CDNA and RDNA4 which use FP32 compute type by default) and memory use will be higher. Prompt processing may become faster on recent datacenter GPUs (the custom kernels were tuned primarily for RTX 3000/4000).   |
 | GGML_CUDA_PEER_MAX_BATCH_SIZE | Positive integer       | 128     | Maximum batch size for which to enable peer access between multiple GPUs. Peer access requires either Linux or NVLink. When using NVLink enabling peer access for larger batch sizes is potentially beneficial.                                                                                                                                                                  |
-| GGML_CUDA_FA_ALL_QUANTS       | Boolean                | false   | Compile support for all KV cache quantization type (combinations) for the FlashAttention CUDA kernels. More fine-grained control over KV cache size but compilation takes much longer.                                                                                                                                                                                           |
+| GGML_CUDA_FA_QUANTS           | `all` or `type_K-type_V` list | q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16 | Select which K/V type combinations to compile the FlashAttention CUDA kernels for. `all` compiles every combination, but compilation takes much longer. Otherwise a `;`-separated list of `type_K-type_V` pairs; f16-f16 is always compiled. Combinations that were not compiled fall back to f16-f16 kernel with a warning. Legal types: f16, bf16, q4_0, q4_1, q5_0, q5_1, q8_0. |
+| GGML_CUDA_FA_ALL_QUANTS       | Boolean                | false   | Deprecated alias for `GGML_CUDA_FA_QUANTS=all`.                                                                                                                                                                                                                                                                                                                               |
 
 ## MUSA
 

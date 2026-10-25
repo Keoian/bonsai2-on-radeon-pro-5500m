@@ -34,8 +34,11 @@
 
 #define N_R0_PQ2_0 8
 #define N_SG_PQ2_0 2
-#define N_R0_PTQ1_0 4
+// The dense kernel can amortize each activation load across five output rows.
+// Keep MUL_MAT_ID at four: its five-row specialization fails numerical validation.
+#define N_R0_PTQ1_0 5
 #define N_SG_PTQ1_0 1
+#define N_R0_ID_PTQ1_0 4
 
 #define N_R0_Q4_0 4
 #define N_SG_Q4_0 2
@@ -489,6 +492,15 @@ typedef struct {
     int16_t  r2;
     int16_t  r3;
 } ggml_metal_kargs_mul_mm;
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne11;
+    uint64_t nb01;
+    uint64_t nb11;
+    int32_t  ne0;
+} ggml_metal_kargs_mul_mm_fewrow;
 
 typedef struct {
     int32_t  ne00;

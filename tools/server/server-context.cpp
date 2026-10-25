@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
+#include <iterator>
 #include <memory>
 #include <filesystem>
 #include <utility>
@@ -205,6 +206,7 @@ struct server_slot {
 
     // speculative decoding
     common_speculative * spec;
+    int32_t spec_depth_max = 0; // no drafting once the sequence is longer than this (0 = always draft)
 
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
@@ -347,6 +349,7 @@ struct server_slot {
 
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
+        stats.speculative = can_speculate();
         n_accepted_per_pos.clear();
 
         n_predict_max = -1;
@@ -438,6 +441,12 @@ struct server_slot {
         GGML_ASSERT(task);
 
         if (!can_speculate()) {
+            return 0;
+        }
+
+        // deep in the context the draft passes and the multi-column verify cost more than the
+        // accepted tokens save (see --spec-draft-depth-max); decode one token per step from here
+        if (spec_depth_max > 0 && prompt.n_tokens() > spec_depth_max) {
             return 0;
         }
 
@@ -1194,9 +1203,35 @@ private:
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
         }
 
+        std::vector<common_speculative_type> spec_types_requested;
+        std::copy_if(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                std::back_inserter(spec_types_requested),
+                [](common_speculative_type t) { return t != COMMON_SPECULATIVE_TYPE_NONE; });
+
         if (spec) {
-            SRV_TRC("%s", "speculative decoding context initialized\n");
+            const auto spec_types_active = common_speculative_get_types(spec.get());
+            SRV_INF("speculative decoding enabled: %s\n",
+                    common_speculative_type_name_str(spec_types_active).c_str());
+
+            std::vector<common_speculative_type> spec_types_skipped;
+            for (const auto t : spec_types_requested) {
+                if (std::find(spec_types_active.begin(), spec_types_active.end(), t) == spec_types_active.end()) {
+                    spec_types_skipped.push_back(t);
+                }
+            }
+            if (!spec_types_skipped.empty()) {
+                SRV_WRN("speculative types requested but not initialized (e.g. no draft model): %s\n",
+                        common_speculative_type_name_str(spec_types_skipped).c_str());
+            }
         } else {
+            if (!spec_types_requested.empty()) {
+                SRV_WRN("speculative decoding (%s) was requested but is disabled: %s\n",
+                        common_speculative_type_name_str(spec_types_requested).c_str(),
+                        ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO
+                            ? "the target context cannot remove tokens from a sequence"
+                            : "no speculative implementation could be initialized");
+            }
+
             spec_init.reset();
             ctx_dft   = nullptr;
             model_dft = nullptr;
@@ -1210,7 +1245,10 @@ private:
             slot.ctx_dft = ctx_dft;
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
+            slot.spec_depth_max = params_base.speculative.draft.n_depth_max;
             slot.n_ctx   = n_ctx_slot;
+
+            slot.stats.speculative = slot.can_speculate();
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -1404,7 +1442,10 @@ private:
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
                 /* media_path            */ params_base.media_path,
-                /* force_pure_content    */ params_base.force_pure_content_parser
+                /* force_pure_content    */ params_base.force_pure_content_parser,
+                /* reasoning_effort_allow    */ params_base.reasoning_effort_allow,
+                /* reasoning_effort_fallback */ params_base.reasoning_effort_fallback,
+                /* reasoning_max_tok_floor   */ params_base.reasoning_max_tokens_floor
             };
 
             {
@@ -1893,18 +1934,9 @@ private:
                 });
             }
         } else {
-            std::vector<llama_token_data> cur = get_token_probabilities(ctx_tgt, idx, n_probs_request);
-            const size_t max_probs = cur.size();
-            const size_t n_probs = std::min(max_probs, n_probs_request);
-
-            // set probability for sampled token
-            for (size_t i = 0; i < max_probs; i++) {
-                // set probability for sampled token
-                if (cur[i].id == result.tok) {
-                    result.prob = cur[i].p;
-                    break;
-                }
-            }
+            // also sets the probability for the sampled token
+            std::vector<llama_token_data> cur = get_token_probabilities(ctx_tgt, idx, n_probs_request, result.tok, &result.prob);
+            const size_t n_probs = std::min(cur.size(), n_probs_request);
 
             // set probability for top n_probs tokens
             result.probs.reserve(n_probs);
@@ -2209,6 +2241,14 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // the buffers of an evicted checkpoint go to the new one: a fresh vector is zero-filled by resize()
+        std::vector<uint8_t> spare_tgt;
+        std::vector<uint8_t> spare_dft;
+        const auto keep_spare = [&](common_prompt_checkpoint & ckpt) {
+            spare_tgt = std::move(ckpt.data_tgt);
+            spare_dft = std::move(ckpt.data_dft);
+        };
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         int64_t last = -1;
@@ -2217,6 +2257,7 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
+                keep_spare(*it);
                 it = slot.prompt.checkpoints.erase(it);
                 continue;
             }
@@ -2227,17 +2268,21 @@ private:
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            auto & cur = slot.prompt.checkpoints.front();
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
+            keep_spare(cur);
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
         cur.id_task = id_task;
+
+        cur.data_tgt = std::move(spare_tgt);
+        cur.data_dft = std::move(spare_dft);
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
@@ -3625,7 +3670,19 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (spec) {
+        // past --spec-draft-depth-max a slot does not draft, so its draft context has no use for
+        // these rows: skip the hook (and the draft-model decode it implies) when every token of this
+        // view sits beyond the cutoff. Positions, not the slot's token count, decide it, so the early
+        // ubatches of a long prompt still reach the draft context and stay reusable as a prefix.
+        bool spec_process = spec != nullptr;
+        if (spec_process && params_base.speculative.draft.n_depth_max > 0) {
+            spec_process = false;
+            for (int i = 0; i < batch_view.n_tokens && !spec_process; ++i) {
+                spec_process = batch_view.pos[i] <= params_base.speculative.draft.n_depth_max;
+            }
+        }
+
+        if (spec_process) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);

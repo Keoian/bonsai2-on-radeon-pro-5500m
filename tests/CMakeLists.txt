@@ -147,7 +147,11 @@ endif()
 # dspark Phase 1 forward-graph gate (Tier 1: synthetic tap features / Tier 2:
 # diff vs the DeepSpec python reference). Not wired into `ctest` since both
 # tiers need a real dspark GGUF passed on the command line; run manually.
-llama_build(test-dspark-forward.cpp)
+# Uses internal functions not exported with LLAMA_API, so like the tests below it
+# is skipped on Windows when building with shared libraries.
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    llama_build(test-dspark-forward.cpp)
+endif()
 
 # dspark loader gate for the GIDD log-SNR metadata contract: conditioning=true
 # requires finite, ordered min/max_log_snr (src/models/dspark.cpp
@@ -301,6 +305,7 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_build_and_test(test-mtp-catchup-batch.cpp)
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
@@ -310,6 +315,7 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+llama_build_and_test(test-moe-weighted-reduce.cpp)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
@@ -334,6 +340,7 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-quantize-fns.cpp)
 llama_build_and_test(test-ptq1_0-element-map.cpp)
 llama_build_and_test(test-ptq1_0-cuda-dot.cpp)
+llama_build_and_test(test-pq2-row-shapes.cpp)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
     llama_build_and_test(test-col2im-1d.cpp)
