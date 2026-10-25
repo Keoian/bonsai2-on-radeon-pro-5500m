@@ -24,6 +24,8 @@ const bool USE_MASK_OPT    = (Flags & 1) != 0;
 const bool MASK_ENABLE     = (Flags & 2) != 0;
 const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
 const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
+// RDNA1/2 wave64: subgroupShuffleXor(x, 32) crosses the two wave halves and compiles to a slow per-lane loop, so do that step through shmem
+const bool XOR32_SHMEM     = (Flags & 16) != 0 && SubGroupSize == 64;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;

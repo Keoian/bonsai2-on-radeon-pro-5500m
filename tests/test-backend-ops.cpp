@@ -11823,6 +11823,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
         }
     }
+    for (int64_t kv : {256, 1024, 4096, 16384, 32768, 65536}) {  // Bonsai decode and MTP verify on the q8_0 K / q4_0 V cache, real cache layout
+        for (int64_t nb : {1, 2}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
+        }
+    }
     for (ggml_type t : {GGML_TYPE_Q4_0, GGML_TYPE_F16}) {  // ARC-LAB: Bonsai 27B prompt batch at 16K history
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 16384, 512, true, false, 0, 0, GGML_PREC_F32, t, t));
         for (int64_t kv : {512, 16384}) {  // real KV-cache layout (heads interleaved per token)

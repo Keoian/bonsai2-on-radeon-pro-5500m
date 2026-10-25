@@ -74,6 +74,37 @@ shared block_a_cache kblocksh[SHMEM_STAGING != 0 ? Bc * qf_stride : 1];
 
 shared vec4 occupancy_limiter[LIMIT_OCCUPANCY_SHMEM > 0 ? LIMIT_OCCUPANCY_SHMEM : 1];
 
+shared float xchgsh[XOR32_SHMEM ? WorkGroupSize : 1];
+shared FLOAT_TYPEV4 xchgshv4[XOR32_SHMEM ? WorkGroupSize : 1];
+
+float shuffle_xor(float v, uint s) {
+    if (XOR32_SHMEM && s == 32) {
+        xchgsh[gl_LocalInvocationIndex] = v;
+        subgroupBarrier();
+        v = xchgsh[gl_LocalInvocationIndex ^ 32];
+        subgroupBarrier();
+        return v;
+    }
+    return subgroupShuffleXor(v, s);
+}
+
+FLOAT_TYPEV4 shuffle_xor(FLOAT_TYPEV4 v, uint s) {
+    if (XOR32_SHMEM && s == 32) {
+        xchgshv4[gl_LocalInvocationIndex] = v;
+        subgroupBarrier();
+        v = xchgshv4[gl_LocalInvocationIndex ^ 32];
+        subgroupBarrier();
+        return v;
+    }
+    if (OLD_AMD_WINDOWS) {
+        // Something about f16vec4 subgroupShuffleXor is broken on AMD Windows RDNA2 and below.
+        // Shuffle full vec4 as workaround.
+        // See https://github.com/ggml-org/llama.cpp/issues/19881#issuecomment-3958643697
+        return FLOAT_TYPEV4(subgroupShuffleXor(vec4(v), s));
+    }
+    return subgroupShuffleXor(v, s);
+}
+
 #ifdef MMQ
 #include "flash_attn_mmq_funcs.glsl"
 #endif
@@ -547,7 +578,7 @@ void main() {
         // Compute max across the row
         if (SubGroupSize > 0) {
             [[unroll]] for (uint s = D_split; s < SubGroupSize; s *= 2) {
-                rowmaxf = max(rowmaxf, subgroupShuffleXor(rowmaxf, s));
+                rowmaxf = max(rowmaxf, shuffle_xor(rowmaxf, s));
             }
             if (row_split == 1) {
                 // Reduce inside workgroup with shmem
@@ -586,7 +617,7 @@ void main() {
         // Compute sum across the row
         if (SubGroupSize > 0) {
             [[unroll]] for (uint s = D_split; s < SubGroupSize; s *= 2) {
-                Lf[r] += subgroupShuffleXor(Lf[r], s);
+                Lf[r] += shuffle_xor(Lf[r], s);
             }
             if (row_split == 1) {
                 barrier();
@@ -617,14 +648,7 @@ void main() {
 
             if (SubGroupSize > 0) {
                 [[unroll]] for (uint s = D_split; s < SubGroupSize; s *= 2) {
-                    if (!OLD_AMD_WINDOWS) {
-                        Of[r][d] += subgroupShuffleXor(Of[r][d], s);
-                    } else {
-                        // Something about f16vec4 subgroupShuffleXor is broken on AMD Windows RDNA2 and below.
-                        // Shuffle full vec4 as workaround.
-                        // See https://github.com/ggml-org/llama.cpp/issues/19881#issuecomment-3958643697
-                        Of[r][d] += FLOAT_TYPEV4(subgroupShuffleXor(vec4(Of[r][d]), s));
-                    }
+                    Of[r][d] += shuffle_xor(Of[r][d], s);
                 }
                 if (row_split == 1) {
                     barrier();
