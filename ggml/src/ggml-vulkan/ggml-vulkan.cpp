@@ -18396,6 +18396,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     a = op->src[2];
                     b = op->src[1];
                 }
+                // A Hadamard-hinted matmul runs as FWHT over the rows of b, so any batch shape works,
+                // including the [n, 1, n_head, n_tokens] KV-cache rotations that broadcast a over dim 3.
+                if (op->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+                    a->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ggml_is_contiguous(b)) {
+                    const int idx = ggml_vk_fwht_pipeline_idx(b->ne[0]);
+                    if (idx >= 0 && (b->type == GGML_TYPE_F16 ? device->pipeline_fwht_f16[idx] : b->type == GGML_TYPE_F32 ? device->pipeline_fwht_f32[idx] : nullptr) != nullptr) {
+                        return true;
+                    }
+                }
                 if (a->ne[3] != b->ne[3]) {
                     return false;
                 }
