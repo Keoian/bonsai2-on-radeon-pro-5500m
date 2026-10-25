@@ -21,7 +21,44 @@ void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
         buf_a[buf_ib].dm = FLOAT_TYPE(data_a[block_idx].d);
     }
 }
+#endif
 
+#if defined(DATA_A_PTQ1_0)
+#include "ptq1_0.glsl"
+
+// Unsigned trits 0..2, the -1 offset goes through the q8_1 sums like Q2_0.
+// Elements 4*iqs .. 4*iqs+3 of a 32-element sub-block are one qs dword at one trit level, or two qh levels for elements 120..127.
+void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
+    const uint block_idx = ib / 4;
+    const uint e0 = (ib & 3u) * 32u + iqs * 4u;
+
+    uint q;
+    if (e0 < 120u) {
+        const uint w = data_a_packed32[block_idx].qs[e0 < 80u ? (e0 & 15u) >> 2u : 4u + (((e0 - 80u) & 7u) >> 2u)];
+        const uint m = POW3_MOD256[e0 < 80u ? e0 >> 4u : (e0 - 80u) >> 3u];
+        // two bytes per 16-bit lane: bytes 0,2 in lo, bytes 1,3 in hi; the trit lands in bits 8-9 of each lane
+        const uint lo = (((w & 0x00FF00FFu) * m) & 0x00FF00FFu) * 3u;
+        const uint hi = ((((w >> 8u) & 0x00FF00FFu) * m) & 0x00FF00FFu) * 3u;
+        q = ((lo >> 8u) & 0x00030003u) | (hi & 0x03000300u);
+    } else {
+        const uint qh = data_a_packed32[block_idx].qh_d;
+        uint v = (qh & 0xFFu) | ((qh & 0xFF00u) << 8u);
+        if (e0 == 124u) {
+            v = (v * 9u) & 0x00FF00FFu;
+        }
+        const uint t0 = v * 3u;
+        const uint t1 = (t0 & 0x00FF00FFu) * 3u;
+        q = ((t0 >> 8u) & 0x3u) | ((t0 >> 16u) & 0x300u) | ((t1 << 8u) & 0x30000u) | (t1 & 0x03000000u);
+    }
+    buf_a[buf_ib].qs[iqs] = int32_t(q);
+
+    if (iqs == 0) {
+        buf_a[buf_ib].dm = FLOAT_TYPE(data_a[block_idx].d);
+    }
+}
+#endif
+
+#if defined(DATA_A_Q2_0) || defined(DATA_A_PTQ1_0)
 void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
     cache_a[reg_ib].dm = buf_a[buf_ib].dm;
 
