@@ -32,6 +32,9 @@ layout(push_constant) uniform Parameters {
     uint neq1, rq3;
     float scale;
     uint K;
+    // GDN_ROWS: floats per cache row, and 1 when the snapshots go straight to the cache rows in data_wrows (fused SET_ROWS)
+    uint row_stride;
+    uint fused_write;
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -39,8 +42,17 @@ layout(binding = 1) readonly  buffer KBuf     { FLOAT_TYPE data_k[];     };
 layout(binding = 2) readonly  buffer VBuf     { FLOAT_TYPE data_v[];     };
 layout(binding = 3) readonly  buffer GBuf     { FLOAT_TYPE data_g[];     };
 layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
+#ifdef GDN_ROWS
+// the whole state cache: each sequence reads its row data_rows[seq]; a fused SET_ROWS writes the snapshots back into it
+layout(binding = 5)           buffer StateBuf { FLOAT_TYPE data_state[]; };
+#else
 layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
+#endif
 layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
+#ifdef GDN_ROWS
+layout(binding = 7) readonly  buffer RowsBuf  { int data_rows[];  };
+layout(binding = 8) readonly  buffer WRowsBuf { int data_wrows[]; }; // int64 cache row of (slot, seq), low words
+#endif
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
 shared FLOAT_TYPE temp[SUBGROUP_SIZE];
@@ -102,8 +114,12 @@ void main() {
     const uint iq3 = seq_id / rq3;
 
     const uint state_size = S_V * S_V;
+#ifdef GDN_ROWS
+    const uint state_in_base       = uint(data_rows[seq_id]) * row_stride + head_id * state_size;
+#else
     // input state holds s0 only [S_v, S_v, H, n_seqs]: per-seq stride is H*D.
     const uint state_in_base       = (seq_id * H + head_id) * state_size;
+#endif
     // output state layout per slot: same per-(seq,head) offset as the single-slot case.
     const uint state_out_base      = (seq_id * H + head_id) * state_size;
     const uint state_size_per_snap = state_size * H * n_seqs;
@@ -173,6 +189,16 @@ void main() {
         if (K > 1u) {
             const int target_slot = int(n_tokens) - 1 - int(t);
             if (target_slot >= 0 && target_slot < int(K)) {
+#ifdef GDN_ROWS
+                if (fused_write != 0u) {
+                    // each lane rewrites only the elements it read at the start, so the in-place update is safe
+                    const uint row_base = uint(data_wrows[2u * (uint(target_slot) * n_seqs + seq_id)]) * row_stride + head_id * state_size;
+                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                        data_state[row_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
+                    }
+                    continue;
+                }
+#endif
                 const uint slot_base = s_off + uint(target_slot) * state_size_per_snap + state_out_base;
                 [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
                     data_dst[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
@@ -182,6 +208,15 @@ void main() {
     }
 
     if (K == 1u) {
+#ifdef GDN_ROWS
+        if (fused_write != 0u) {
+            const uint row_base = uint(data_wrows[2u * seq_id]) * row_stride + head_id * state_size;
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                data_state[row_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
+            }
+            return;
+        }
+#endif
         [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
             data_dst[s_off + state_out_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
         }

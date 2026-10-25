@@ -1089,6 +1089,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_gated_linear_attn_f32;
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
+    vk_pipeline pipeline_gated_delta_net_rows[4][2];
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -1887,6 +1888,8 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    uint32_t row_stride;  // rows variant: floats per cache row
+    uint32_t fused_write; // rows variant: snapshots go to the cache rows of a fused SET_ROWS
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -2424,6 +2427,7 @@ struct ggml_backend_vk_context {
     bool fused_topk_moe_scale {};
     // set when the current node leads a MUL -> RESHAPE -> MUL_MAT(hadamard) fusion
     bool fused_fwht_signed {};
+    bool fused_gdn_set_rows {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -5938,6 +5942,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             {"gated_delta_net_f32_d64",     "gated_delta_net_f32_d64_kda"},
             {"gated_delta_net_f32_d128",    "gated_delta_net_f32_d128_kda"},
         };
+        const char * gdn_rows_names[][2] = {
+            {"gated_delta_net_f32_d16_rows",  "gated_delta_net_f32_d16_kda_rows"},
+            {"gated_delta_net_f32_d32_rows",  "gated_delta_net_f32_d32_kda_rows"},
+            {"gated_delta_net_f32_d64_rows",  "gated_delta_net_f32_d64_kda_rows"},
+            {"gated_delta_net_f32_d128_rows", "gated_delta_net_f32_d128_kda_rows"},
+        };
         for (uint32_t si = 0; si < 4; si++) {
             const uint32_t S_V = gdn_sizes[si];
             GGML_ASSERT(is_pow2(S_V));
@@ -5972,17 +5982,24 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const bool use_clustered_reduce = device->subgroup_arithmetic && device->subgroup_clustered && need_partial_subgroup_reduce;
             const bool use_subgroup_reduce = device->subgroup_arithmetic && !need_partial_subgroup_reduce;
             const bool use_subgroup_ops = use_clustered_reduce || use_subgroup_reduce;
-            size_t gdn_len;
+            size_t gdn_len, gdn_rows_len;
             const void * gdn_data;
+            const void * gdn_rows_data;
             if (use_clustered_reduce) {
                 gdn_len = gated_delta_net_f32_len;
                 gdn_data = (const void *)gated_delta_net_f32_data;
+                gdn_rows_len = gated_delta_net_f32_rows_len;
+                gdn_rows_data = (const void *)gated_delta_net_f32_rows_data;
             } else if (use_subgroup_reduce) {
                 gdn_len = gated_delta_net_f32_nocluster_len;
                 gdn_data = (const void *)gated_delta_net_f32_nocluster_data;
+                gdn_rows_len = gated_delta_net_f32_nocluster_rows_len;
+                gdn_rows_data = (const void *)gated_delta_net_f32_nocluster_rows_data;
             } else {
                 gdn_len = gated_delta_net_f32_shmem_len;
                 gdn_data = (const void *)gated_delta_net_f32_shmem_data;
+                gdn_rows_len = gated_delta_net_f32_shmem_rows_len;
+                gdn_rows_data = (const void *)gated_delta_net_f32_shmem_rows_data;
             }
 
             const uint32_t cols_per_wg = device->subgroup_size / lanes_per_column;
@@ -5991,6 +6008,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_rows[si][kda],
+                    gdn_rows_names[si][kda], gdn_rows_len, gdn_rows_data, "main", 9, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
             }
         }
@@ -11918,7 +11938,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 case 128: si = 3; break;
                 default: return nullptr;
             }
-            return ctx->device->pipeline_gated_delta_net[si][kda];
+            return dst->src[6] ? ctx->device->pipeline_gated_delta_net_rows[si][kda] : ctx->device->pipeline_gated_delta_net[si][kda];
         }
         return nullptr;
     case GGML_OP_SSM_SCAN:
@@ -12981,7 +13001,8 @@ static void ggml_vk_gated_linear_attn(ggml_backend_vk_context * ctx, vk_context&
         pc, { (uint32_t)(n_seqs * n_heads), 1, 1 });
 }
 
-static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+// set_rows: the SET_ROWS that scatters this op's snapshots into the state cache, fused into the op (rows variant only)
+static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const ggml_tensor * set_rows = nullptr) {
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_v     = dst->src[2];
     const ggml_tensor * src_beta  = dst->src[4];
@@ -13022,6 +13043,7 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     const uint32_t neq1 = (uint32_t)src_q->ne[1];
     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
 
+    const ggml_tensor * rows = dst->src[6];
     const float scale = 1.0f / sqrtf((float)S_v);
     const vk_op_gated_delta_net_push_constants pc = {
         H, n_tokens, n_seqs, s_off,
@@ -13030,12 +13052,70 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         sb1, sb2, sb3,
         neq1, rq3,
         scale,
-        K
+        K,
+        rows ? (uint32_t)(dst->src[5]->nb[1] / sizeof(float)) : 0u,
+        set_rows ? 1u : 0u,
     };
+
+    if (rows) {
+        const vk_subbuffer rows_buf  = ggml_vk_tensor_subbuffer(ctx, rows);
+        const vk_subbuffer wrows_buf = set_rows ? ggml_vk_tensor_subbuffer(ctx, set_rows->src[1]) : rows_buf;
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, rows_buf, wrows_buf},
+            pc, { H, n_seqs, S_v });
+        return;
+    }
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
         pc, { H, n_seqs, S_v });
+}
+
+// GATED_DELTA_NET (rows variant) -> VIEW of its snapshots -> SET_ROWS into the state cache it read, with the VIEW of the
+// attention scores before or after the snapshot VIEW: the op writes the snapshots to the cache rows itself. Returns the
+// number of nodes after the op that fuse (0: none). Single sequence only: with several, one sequence's destination row can
+// be another's source row.
+static int ggml_vk_can_fuse_gdn_set_rows(const struct ggml_cgraph * cgraph, int node_idx) {
+    int n_extra = 0;
+    if (ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_GATED_DELTA_NET, GGML_OP_VIEW, GGML_OP_SET_ROWS }, { node_idx, node_idx + 2 })) {
+        n_extra = 2;
+    } else if (ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_GATED_DELTA_NET, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_SET_ROWS },
+                                      { node_idx, node_idx + 1, node_idx + 2, node_idx + 3 })) {
+        n_extra = 3;
+    } else {
+        return 0;
+    }
+    const ggml_tensor * gdn  = cgraph->nodes[node_idx];
+    const ggml_tensor * sr   = cgraph->nodes[node_idx + n_extra];
+    const ggml_tensor * view = sr->src[0];
+    // the snapshot VIEW is one of the fused VIEWs of the op, and only the SET_ROWS reads it (the op no longer writes it)
+    int i_view = -1;
+    for (int k = 1; k < n_extra; ++k) {
+        if (cgraph->nodes[node_idx + k] == view) {
+            i_view = node_idx + k;
+        } else if (cgraph->nodes[node_idx + k]->src[0] != gdn) {
+            return 0;
+        }
+    }
+    if (gdn->src[6] == nullptr || i_view < 0 || view->src[0] != gdn || ggml_node_get_use_count(cgraph, i_view) != 1) {
+        return 0;
+    }
+    const ggml_tensor * v     = gdn->src[2];
+    const ggml_tensor * cache = gdn->src[5];
+    const int64_t S_v = v->ne[0], H = v->ne[1], n_tokens = v->ne[2], n_seqs = v->ne[3];
+    const int64_t D   = S_v * S_v * H;
+    const int64_t K   = ggml_get_op_params_i32(gdn, 0);
+    // the view is the snapshot region [D, n_written*n_seqs] right after the attention scores
+    if (n_seqs != 1 || view->ne[0] != D || view->ne[1] != std::min(n_tokens, K) * n_seqs || view->nb[1] != (size_t) D * sizeof(float) ||
+        view->view_offs != (size_t) (S_v * H * n_tokens * n_seqs) * sizeof(float)) {
+        return 0;
+    }
+    // the SET_ROWS destination is the cache the op read, row for row
+    const ggml_tensor * sr_dst = sr->view_src ? sr->view_src : sr;
+    const ggml_tensor * c_base = cache->view_src ? cache->view_src : cache;
+    const bool ok = sr_dst == c_base && sr->view_offs == cache->view_offs && sr->type == GGML_TYPE_F32 && sr->nb[1] == cache->nb[1] &&
+        sr->ne[0] == D && sr->src[1]->type == GGML_TYPE_I64 && ggml_is_contiguous(sr->src[1]);
+    return ok ? n_extra : 0;
 }
 
 static void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
@@ -16005,7 +16085,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
 
     case GGML_OP_GATED_DELTA_NET:
-        ggml_vk_gated_delta_net(ctx, compute_ctx, node);
+        ggml_vk_gated_delta_net(ctx, compute_ctx, node, ctx->fused_gdn_set_rows ? cgraph->nodes[node_idx + ctx->num_additional_fused_ops] : nullptr);
 
         break;
 
@@ -17455,6 +17535,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
         ctx->fused_fwht_signed = false;
+        ctx->fused_gdn_set_rows = false;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
@@ -17462,6 +17543,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+            } else if (int n_gdn = ggml_vk_can_fuse_gdn_set_rows(cgraph, i)) {
+                ctx->num_additional_fused_ops = n_gdn;
+                ctx->fused_gdn_set_rows = true;
+                ctx->fused_ops_write_mask |= 1; // the attention scores still go to the op's own output
+                fusion_string = "GATED_DELTA_NET_SET_ROWS";
             } else if (ggml_vk_can_fuse_fwht_signed(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 2;
                 ctx->fused_fwht_signed = true;
@@ -17631,7 +17717,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             bool is_topk_moe_single_row = ctx->fused_topk_moe_mode != TOPK_MOE_COUNT &&
                                           ggml_nrows(cgraph->nodes[i]->src[0]) == 1;
 
-            if (!is_topk_moe_single_row) {
+            // the fused GDN writes the cache it reads, but each invocation loads its elements before it stores them
+            if (!is_topk_moe_single_row && !ctx->fused_gdn_set_rows) {
                 for (int j = 0; j < 2; ++j) {
                     ggml_tensor *dst = output_nodes[j];
                     if (!dst) {
@@ -17668,6 +17755,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_fwht_signed        = false;
+                ctx->fused_gdn_set_rows       = false;
             }
         }
 
@@ -18794,8 +18882,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && op->src[0]->ne[0] == 64;
         case GGML_OP_GATED_DELTA_NET:
             {
-                // rows-indexed state read (src[6]) not implemented on Vulkan yet
-                if (op->src[6] != nullptr) {
+                // rows variant: per-sequence state rows of a 2D cache view, picked by the I32 row indices in src[6]
+                if (op->src[6] != nullptr && (op->src[6]->type != GGML_TYPE_I32 || !ggml_is_contiguous(op->src[6]) ||
+                        !ggml_is_contiguous(op->src[5]) || op->src[5]->ne[2] != 1 || op->src[5]->ne[3] != 1)) {
                     return false;
                 }
                 // raw gates (ggml_gated_delta_net_set_raw_gates): beta and g arrive

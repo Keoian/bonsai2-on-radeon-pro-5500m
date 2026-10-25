@@ -164,8 +164,11 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         // integrated GPUs (e.g. unified-memory CUDA devices) report IGPU, not GPU
         const bool is_gpu = ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
                             ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_IGPU;
-        if (is_gpu && strcmp(reg_name, "MTL") != 0) {
+        if (is_gpu && strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "Vulkan") != 0) {
             gdn_state_rows_dev_ok = false;
+        }
+        if (strcmp(reg_name, "Vulkan") == 0) {
+            gdn_state_rows_vk = true;
         }
         if (strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "CUDA") != 0 &&
             strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0 && strcmp(reg_name, "CPU") != 0) {
@@ -486,17 +489,19 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // ring path: read per-seq live state directly from the cache inside the
     // fused GDN op (rows mode) instead of a gather per layer.
     // GGML_GDN_STATE_GATHER=1 restores the legacy gathered path (A/B).
-    // rows mode (the src[6] variant) is implemented on CPU and Metal only;
+    // rows mode (the src[6] variant) is implemented on CPU, Metal and Vulkan only;
     // other GPU backends reject it in supports_op, which would silently move
     // the whole recurrent op to CPU -- keep the gathered form unless every
-    // GPU device in the model is Metal.
+    // GPU device in the model is Metal or Vulkan. On Vulkan it also runs without
+    // rollback slots (no speculative decoding), with K = 1, when the fused GDN op is in use.
     static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
 
     // ARC-LAB: GDN rollback by replay (the memory decides, see llama_memory_recurrent::rpl): the state is the base
     // row in plane 0, gathered with its own row indices (s_copy carries the conv rollback plane)
     const bool gdn_rpl = inp->s_rpl_ctrl != nullptr;
 
-    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0 && !gdn_rpl;
+    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && !gdn_rpl &&
+        (cparams.n_rs_seq > 0 || (gdn_state_rows_vk && cparams.fused_gdn_ar && cparams.fused_gdn_ch));
 
     ggml_tensor * state;
     if (gdn_rpl) {
