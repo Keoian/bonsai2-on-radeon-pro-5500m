@@ -777,6 +777,10 @@ static constexpr uint32_t GGML_VK_FWHT_NUM_SIZES         = 8;
 static constexpr uint32_t GGML_VK_FWHT_MAX_SUBGROUP_N    = 2048;
 static constexpr uint32_t GGML_VK_FWHT_MAX_SUBGROUP_EL_W = 64;
 static constexpr uint32_t GGML_VK_FWHT_ROWS              = 4;
+// up to this many rows (a decode step's few vectors) one row takes a workgroup of GGML_VK_FWHT_WIDE_BLOCK
+// invocations; under one subgroup per row they left most CUs idle (5 rows of 1024: 27 -> 7 us)
+static constexpr uint32_t GGML_VK_FWHT_WIDE_BLOCK        = 256;
+static constexpr uint32_t GGML_VK_FWHT_WIDE_MAX_ROWS     = 256;
 
 struct vk_device_struct {
     std::recursive_mutex mutex;
@@ -1057,6 +1061,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_fwht_signed_f32[GGML_VK_FWHT_NUM_SIZES];
     // rows a workgroup covers, chosen per width when the pipeline is built
     uint32_t fwht_rows_per_wg[GGML_VK_FWHT_NUM_SIZES] = {};
+    // one row per workgroup over several subgroups, for transforms of a few rows (decode)
+    vk_pipeline pipeline_fwht_wide_f32[GGML_VK_FWHT_NUM_SIZES];
+    vk_pipeline pipeline_fwht_wide_signed_f32[GGML_VK_FWHT_NUM_SIZES];
     vk_pipeline pipeline_cumsum_f32;
     vk_pipeline pipeline_cumsum_small_f32;
     vk_pipeline pipeline_cumsum_multipass1_f32;
@@ -5844,6 +5851,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     ggml_vk_create_pipeline(device, device->pipeline_fwht_signed_f32[idx], "fwht_signed_f32", fwht_signed_f32_len, fwht_signed_f32_data, "main", 3, sizeof(vk_op_fwht_signed_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
                     device->fwht_rows_per_wg[idx] = GGML_VK_FWHT_ROWS;
                 }
+                const uint32_t block = std::min(n, GGML_VK_FWHT_WIDE_BLOCK);
+                if (device->subgroup_require_full_support && device->subgroup_size_control && block > sg && block % sg == 0) {
+                    ggml_vk_create_pipeline(device, device->pipeline_fwht_wide_f32[idx], "fwht_wide_f32", fwht_wide_f32_len, fwht_wide_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block, n, 1, sg }, 1, true, true, sg);
+                    ggml_vk_create_pipeline(device, device->pipeline_fwht_wide_signed_f32[idx], "fwht_wide_signed_f32", fwht_wide_signed_f32_len, fwht_wide_signed_f32_data, "main", 3, sizeof(vk_op_fwht_signed_push_constants), {1, 1, 1}, { block, n, 1, sg }, 1, true, true, sg);
+                }
             } else {
                 // wide blocks trade rows per workgroup for a smaller register block
                 const uint32_t block_size = wide ? std::min(n, 256u) : std::min(sg, n);
@@ -10089,6 +10101,10 @@ static int ggml_vk_fwht_pipeline_idx(int64_t n) {
     }
 }
 
+static bool ggml_vk_fwht_use_wide(const vk_pipeline & wide, uint32_t n_rows) {
+    return wide != nullptr && n_rows <= GGML_VK_FWHT_WIDE_MAX_ROWS;
+}
+
 static bool ggml_vk_can_use_fwht(const ggml_backend_vk_context * ctx, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (ctx->num_additional_fused_ops != 0) {
         return false;
@@ -10120,9 +10136,13 @@ static void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     const int idx = ggml_vk_fwht_pipeline_idx(src->ne[0]);
     vk_pipeline pipeline = src->type == GGML_TYPE_F16 ? ctx->device->pipeline_fwht_f16[idx] : ctx->device->pipeline_fwht_f32[idx];
 
-    const uint32_t rows_per_workgroup = ctx->device->fwht_rows_per_wg[idx];
+    uint32_t rows_per_workgroup = ctx->device->fwht_rows_per_wg[idx];
     GGML_ASSERT(rows_per_workgroup > 0);
     const uint32_t n_rows = (uint32_t)ggml_nrows(src);
+    if (src->type == GGML_TYPE_F32 && ggml_vk_fwht_use_wide(ctx->device->pipeline_fwht_wide_f32[idx], n_rows)) {
+        pipeline = ctx->device->pipeline_fwht_wide_f32[idx];
+        rows_per_workgroup = 1;
+    }
     const uint32_t max_workgroups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
 
     const uint32_t total_workgroups = CEIL_DIV(n_rows, rows_per_workgroup);
@@ -10187,9 +10207,13 @@ static void ggml_vk_fwht_signed(ggml_backend_vk_context * ctx, vk_context& subct
     const int idx = ggml_vk_fwht_pipeline_idx(n);
     vk_pipeline pipeline = ctx->device->pipeline_fwht_signed_f32[idx];
 
-    const uint32_t rows_per_workgroup = ctx->device->fwht_rows_per_wg[idx];
+    uint32_t rows_per_workgroup = ctx->device->fwht_rows_per_wg[idx];
     GGML_ASSERT(rows_per_workgroup > 0);
     const uint32_t n_rows = (uint32_t)(ggml_nelements(x) / n);
+    if (ggml_vk_fwht_use_wide(ctx->device->pipeline_fwht_wide_signed_f32[idx], n_rows)) {
+        pipeline = ctx->device->pipeline_fwht_wide_signed_f32[idx];
+        rows_per_workgroup = 1;
+    }
     const uint32_t max_workgroups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
     const uint32_t workgroups_x = std::min(CEIL_DIV(n_rows, rows_per_workgroup), max_workgroups_x);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);

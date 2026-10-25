@@ -1040,6 +1040,8 @@ void process_shaders() {
     string_to_spv("fwht_f32", "fwht.comp", {});
     string_to_spv("fwht_signed_f32", "fwht.comp", {{"FWHT_SIGNED", "1"}});
     string_to_spv("fwht_shmem_f32", "fwht.comp", {{"FWHT_SHMEM", "1"}});
+    string_to_spv("fwht_wide_f32", "fwht.comp", {{"FWHT_SHMEM", "1"}, {"FWHT_WIDE", "1"}});
+    string_to_spv("fwht_wide_signed_f32", "fwht.comp", {{"FWHT_SHMEM", "1"}, {"FWHT_WIDE", "1"}, {"FWHT_SIGNED", "1"}});
     string_to_spv("fwht_f16", "fwht.comp", {{"FWHT_F16", "1"}});
     string_to_spv("fwht_shmem_f16", "fwht.comp", {{"FWHT_F16", "1"}, {"FWHT_SHMEM", "1"}});
     string_to_spv("count_equal_i32", "count_equal.comp", merge_maps(base_dict, {{"A_TYPE", "int"}, {"B_TYPE", "int"}, {"D_TYPE", "int"}}));

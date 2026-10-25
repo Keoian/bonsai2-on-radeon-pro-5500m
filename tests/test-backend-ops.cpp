@@ -11679,6 +11679,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_fwht_signed(1024, 17408, n_tokens, GGML_TYPE_F32, swiglu));
         }
     }
+    // signed FWHT at the hidden width (5 rows of 1024 per token): decode and verify
+    for (int64_t n_tokens : {1, 2}) {
+        test_cases.emplace_back(new test_fwht_signed(1024, 5120, n_tokens));
+    }
 
 #ifdef GGML_USE_SYCL
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 384, 1, 384));    // m=12 (N=384)
