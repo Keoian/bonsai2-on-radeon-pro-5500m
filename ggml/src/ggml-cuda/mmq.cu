@@ -373,7 +373,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     switch (type) {
 #if !defined(GGML_USE_HIP)
         case GGML_TYPE_PTQ1_0:
-            mmq_supported = turing_mma_available(cc);
+            mmq_supported = turing_mma_available(cc) || ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_DP4A;
             break;
 #endif
         case GGML_TYPE_Q1_0:
