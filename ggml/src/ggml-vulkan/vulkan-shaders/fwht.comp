@@ -32,6 +32,9 @@ layout(push_constant) uniform parameter
 #endif
     uint dst_offset;
     float scale;
+#ifdef FWHT_GLU
+    uint glu_offset;
+#endif
 };
 
 layout(binding = 0, std430) readonly buffer A {
@@ -50,6 +53,14 @@ layout(binding = 2, std430) readonly buffer S { float data_s[]; };
 layout(binding = 3, std430) writeonly buffer Q { block_q8_1_x4 data_q[]; };
 #else
 layout(binding = 2, std430) writeonly buffer Q { block_q8_1_x4 data_q[]; };
+#endif
+#endif
+#ifdef FWHT_GLU
+// FWHT_GLU (with FWHT_SIGNED): the row is swiglu(data_a, data_u) = silu(gate) * up, computed on load
+#ifdef FWHT_Q8
+layout(binding = 4, std430) readonly buffer U { float data_u[]; };
+#else
+layout(binding = 3, std430) readonly buffer U { float data_u[]; };
 #endif
 #endif
 
@@ -90,7 +101,15 @@ void main() {
 
         [[unroll]]
         for (uint i = 0; i < EL_W; ++i) {
-#ifdef FWHT_SIGNED
+#if defined(FWHT_GLU)
+            if (row < n_rows) {
+                const float g = float(data_a[src_offset + row_offset + i * BLOCK_SIZE + tid]);
+                const float x = g / (1.0f + exp(-g)) * data_u[glu_offset + row_offset + i * BLOCK_SIZE + tid];
+                reg[i] = x * data_s[signs_offset + (row_offset % signs_ne) + i * BLOCK_SIZE + tid] * scale;
+            } else {
+                reg[i] = 0.0;
+            }
+#elif defined(FWHT_SIGNED)
             reg[i] = row < n_rows ? float(data_a[src_offset + row_offset + i * BLOCK_SIZE + tid]) * data_s[signs_offset + (row_offset % signs_ne) + i * BLOCK_SIZE + tid] * scale : 0.0;
 #else
             reg[i] = row < n_rows ? float(data_a[src_offset + row_offset + i * BLOCK_SIZE + tid]) * scale : 0.0;

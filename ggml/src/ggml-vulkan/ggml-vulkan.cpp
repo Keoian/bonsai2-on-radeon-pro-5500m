@@ -1068,6 +1068,9 @@ struct vk_device_struct {
     // the wide transforms that also write their result as q8_1 for the next mat-vec
     vk_pipeline pipeline_fwht_wide_q8_f32[GGML_VK_FWHT_NUM_SIZES];
     vk_pipeline pipeline_fwht_wide_signed_q8_f32[GGML_VK_FWHT_NUM_SIZES];
+    // the signed wide transforms that load swiglu(gate, up) instead of a row
+    vk_pipeline pipeline_fwht_wide_signed_glu_f32[GGML_VK_FWHT_NUM_SIZES];
+    vk_pipeline pipeline_fwht_wide_signed_glu_q8_f32[GGML_VK_FWHT_NUM_SIZES];
     vk_pipeline pipeline_cumsum_f32;
     vk_pipeline pipeline_cumsum_small_f32;
     vk_pipeline pipeline_cumsum_multipass1_f32;
@@ -1136,6 +1139,7 @@ struct vk_device_struct {
     bool disable_fa_vec;
     bool disable_ptq1_0_w32;
     bool disable_fwht_q8;
+    bool disable_fwht_glu;
     bool keep_fwht_signed;
 
     std::unique_ptr<vk_memory_logger> memory_logger;
@@ -1441,6 +1445,11 @@ struct vk_op_fwht_signed_push_constants {
     uint32_t signs_ne;
     uint32_t dst_offset;
     float scale;
+};
+
+struct vk_op_fwht_glu_push_constants {
+    vk_op_fwht_signed_push_constants s;
+    uint32_t glu_offset;
 };
 
 struct vk_op_count_experts_push_constants {
@@ -2435,6 +2444,8 @@ struct ggml_backend_vk_context {
     bool fused_topk_moe_scale {};
     // set when the current node leads a MUL -> RESHAPE -> MUL_MAT(hadamard) fusion
     bool fused_fwht_signed {};
+    // set when the current node leads a GLU(swiglu) -> MUL -> RESHAPE -> MUL_MAT(hadamard) fusion
+    bool fused_fwht_glu {};
     bool fused_gdn_set_rows {};
 
     // for GGML_VK_PERF_LOGGER
@@ -5934,6 +5945,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                         ggml_vk_create_pipeline(device, device->pipeline_fwht_wide_q8_f32[idx], "fwht_wide_q8_f32", fwht_wide_q8_f32_len, fwht_wide_q8_f32_data, "main", 3, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block, n, 1, sg }, 1, true, true, sg);
                         ggml_vk_create_pipeline(device, device->pipeline_fwht_wide_signed_q8_f32[idx], "fwht_wide_signed_q8_f32", fwht_wide_signed_q8_f32_len, fwht_wide_signed_q8_f32_data, "main", 4, sizeof(vk_op_fwht_signed_push_constants), {1, 1, 1}, { block, n, 1, sg }, 1, true, true, sg);
                     }
+                    if (!device->disable_fwht_glu) {
+                        ggml_vk_create_pipeline(device, device->pipeline_fwht_wide_signed_glu_f32[idx], "fwht_wide_signed_glu_f32", fwht_wide_signed_glu_f32_len, fwht_wide_signed_glu_f32_data, "main", 4, sizeof(vk_op_fwht_glu_push_constants), {1, 1, 1}, { block, n, 1, sg }, 1, true, true, sg);
+                        if (device->pipeline_fwht_wide_signed_q8_f32[idx] != nullptr) {
+                            ggml_vk_create_pipeline(device, device->pipeline_fwht_wide_signed_glu_q8_f32[idx], "fwht_wide_signed_glu_q8_f32", fwht_wide_signed_glu_q8_f32_len, fwht_wide_signed_glu_q8_f32_data, "main", 5, sizeof(vk_op_fwht_glu_push_constants), {1, 1, 1}, { block, n, 1, sg }, 1, true, true, sg);
+                        }
+                    }
                 }
             } else {
                 // wide blocks trade rows per workgroup for a smaller register block
@@ -6402,6 +6419,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->disable_fa_vec = getenv("GGML_VK_DISABLE_FA_VEC") != nullptr;
         device->disable_ptq1_0_w32 = getenv("GGML_VK_DISABLE_PTQ1_0_W32") != nullptr;
         device->disable_fwht_q8 = getenv("GGML_VK_DISABLE_FWHT_Q8") != nullptr;
+        device->disable_fwht_glu = getenv("GGML_VK_DISABLE_FWHT_GLU") != nullptr;
         device->keep_fwht_signed = getenv("GGML_VK_DISABLE_KEEP_FWHT_SIGNED") == nullptr;
 
         bool fp16_storage = false;
@@ -10350,12 +10368,44 @@ static bool ggml_vk_can_fuse_fwht_signed(const ggml_backend_vk_context * ctx, co
         signs->ne[0] == x->ne[0] && n > 0 && x->ne[0] % n == 0;
 }
 
-static void ggml_vk_fwht_signed(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
-    const ggml_tensor * mul = cgraph->nodes[node_idx];
-    const ggml_tensor * mm  = cgraph->nodes[node_idx + 2];
+// GLU(swiglu, split) -> MUL(signs) -> RESHAPE -> MUL_MAT(hadamard): the wide transform computes silu(gate) * up as it loads the row,
+// so the separate GLU pass is skipped. Decode sizes only (the wide transform).
+static bool ggml_vk_can_fuse_fwht_glu(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (node_idx + 3 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * glu = cgraph->nodes[node_idx];
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr || ggml_get_op_params_i32(glu, 1) != 0) {
+        return false;
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_GLU, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { node_idx + 3 }) ||
+        !ggml_vk_can_fuse_fwht_signed(ctx, cgraph, node_idx + 1)) {
+        return false;
+    }
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * x   = ggml_are_same_shape(mul, mul->src[0]) ? mul->src[0] : mul->src[1];
+    const ggml_tensor * g   = glu->src[0];
+    const ggml_tensor * u   = glu->src[1];
+    if (x != glu || glu->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32 || u->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(g) || !ggml_is_contiguous(u) || !ggml_are_same_shape(g, glu) || !ggml_are_same_shape(u, glu)) {
+        return false;
+    }
+    const int64_t n = cgraph->nodes[node_idx + 3]->src[0]->ne[0];
+    const int idx = ggml_vk_fwht_pipeline_idx(n);
+    return idx >= 0 && ctx->device->pipeline_fwht_wide_signed_glu_f32[idx] != nullptr &&
+        ggml_vk_fwht_use_wide(ctx->device->pipeline_fwht_wide_signed_f32[idx], (uint32_t)(ggml_nelements(glu) / n));
+}
+
+static void ggml_vk_fwht_signed(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx, bool glu) {
+    const ggml_tensor * glu_node = glu ? cgraph->nodes[node_idx] : nullptr;
+    const int mul_idx = node_idx + (glu ? 1 : 0);
+    const ggml_tensor * mul = cgraph->nodes[mul_idx];
+    const ggml_tensor * mm  = cgraph->nodes[mul_idx + 2];
 
     const ggml_tensor * x     = ggml_are_same_shape(mul, mul->src[0]) ? mul->src[0] : mul->src[1];
     const ggml_tensor * signs = (x == mul->src[0]) ? mul->src[1] : mul->src[0];
+    // the row the transform loads: x, or the gate of the GLU (its up is the extra binding)
+    const ggml_tensor * xa = glu ? glu_node->src[0] : x;
 
     const int64_t n = mm->src[0]->ne[0];
     const int idx = ggml_vk_fwht_pipeline_idx(n);
@@ -10369,30 +10419,50 @@ static void ggml_vk_fwht_signed(ggml_backend_vk_context * ctx, vk_context& subct
         pipeline = ctx->device->pipeline_fwht_wide_signed_f32[idx];
         rows_per_workgroup = 1;
         if (ctx->device->pipeline_fwht_wide_signed_q8_f32[idx] != nullptr) {
-            q8_src1 = ggml_vk_fwht_q8_consumer(ctx, cgraph, node_idx + 2);
+            q8_src1 = ggml_vk_fwht_q8_consumer(ctx, cgraph, mul_idx + 2);
         }
     }
-    if (q8_src1 != nullptr) {
+    if (glu) {
+        GGML_ASSERT(pipeline == ctx->device->pipeline_fwht_wide_signed_f32[idx]);
+        pipeline = q8_src1 != nullptr ? ctx->device->pipeline_fwht_wide_signed_glu_q8_f32[idx] : ctx->device->pipeline_fwht_wide_signed_glu_f32[idx];
+        if (pipeline == nullptr) {
+            pipeline = ctx->device->pipeline_fwht_wide_signed_glu_f32[idx];
+            q8_src1 = nullptr;
+        }
+    } else if (q8_src1 != nullptr) {
         pipeline = ctx->device->pipeline_fwht_wide_signed_q8_f32[idx];
     }
     const uint32_t max_workgroups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
     const uint32_t workgroups_x = std::min(CEIL_DIV(n_rows, rows_per_workgroup), max_workgroups_x);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
-    const vk_subbuffer x_buf = ggml_vk_tensor_subbuffer(ctx, x, true);
+    const vk_subbuffer x_buf = ggml_vk_tensor_subbuffer(ctx, xa, true);
     const vk_subbuffer s_buf = ggml_vk_tensor_subbuffer(ctx, signs, true);
     const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, mm, true);
 
     vk_op_fwht_signed_push_constants pc = {
         n_rows,
-        (uint32_t)(get_misalign_bytes(ctx, x)     / ggml_type_size(x->type)),
+        (uint32_t)(get_misalign_bytes(ctx, xa)    / ggml_type_size(xa->type)),
         (uint32_t)(get_misalign_bytes(ctx, signs) / ggml_type_size(signs->type)),
         (uint32_t)signs->ne[0],
         (uint32_t)(get_misalign_bytes(ctx, mm)    / ggml_type_size(mm->type)),
         1.0f / std::sqrt((float)n),
     };
 
-    // descriptor bindings must follow the shader: 0 = x, 1 = dst, 2 = signs, 3 = q8_1 copy
+    // descriptor bindings must follow the shader: 0 = x (or the GLU gate), 1 = dst, 2 = signs, then the q8_1 copy, then the GLU up
+    if (glu) {
+        const ggml_tensor * u = glu_node->src[1];
+        const vk_subbuffer u_buf = ggml_vk_tensor_subbuffer(ctx, u, true);
+        const vk_op_fwht_glu_push_constants gpc = { pc, (uint32_t)(get_misalign_bytes(ctx, u) / ggml_type_size(u->type)) };
+        if (q8_src1 != nullptr) {
+            const vk_subbuffer q8_buf = ggml_vk_fwht_q8_begin(ctx, subctx, mm);
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, d_buf, s_buf, q8_buf, u_buf }, gpc, { workgroups_x, 1, 1 });
+            ggml_vk_fwht_q8_end(ctx, q8_src1);
+        } else {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, d_buf, s_buf, u_buf }, gpc, { workgroups_x, 1, 1 });
+        }
+        return;
+    }
     if (q8_src1 != nullptr) {
         const vk_subbuffer q8_buf = ggml_vk_fwht_q8_begin(ctx, subctx, mm);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, d_buf, s_buf, q8_buf }, pc, { workgroups_x, 1, 1 });
@@ -15934,7 +16004,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     case GGML_OP_MUL:
         if (ctx->fused_fwht_signed) {
-            ggml_vk_fwht_signed(ctx, compute_ctx, cgraph, node_idx);
+            ggml_vk_fwht_signed(ctx, compute_ctx, cgraph, node_idx, false);
         } else if (ctx->num_additional_fused_ops) {
             ggml_vk_snake_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
         } else {
@@ -16089,6 +16159,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         }
         break;
     case GGML_OP_GLU:
+        if (ctx->fused_fwht_glu) {
+            ggml_vk_fwht_signed(ctx, compute_ctx, cgraph, node_idx, true);
+            break;
+        }
         switch (ggml_get_glu_op(node)) {
         case GGML_GLU_OP_GEGLU:
         case GGML_GLU_OP_REGLU:
@@ -17692,6 +17766,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
         ctx->fused_fwht_signed = false;
+        ctx->fused_fwht_glu = false;
         ctx->fused_gdn_set_rows = false;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
@@ -17705,6 +17780,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_gdn_set_rows = true;
                 ctx->fused_ops_write_mask |= 1; // the attention scores still go to the op's own output
                 fusion_string = "GATED_DELTA_NET_SET_ROWS";
+            } else if (ggml_vk_can_fuse_fwht_glu(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 3;
+                ctx->fused_fwht_glu = true;
+                fusion_string = "GLU_MUL_RESHAPE_MUL_MAT";
+                op_srcs_fused_elementwise[0] = true;
+                op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[2] = false;
+                op_srcs_fused_elementwise[3] = false;
             } else if (ggml_vk_can_fuse_fwht_signed(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 2;
                 ctx->fused_fwht_signed = true;
@@ -17912,6 +17995,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_fwht_signed        = false;
+                ctx->fused_fwht_glu           = false;
                 ctx->fused_gdn_set_rows       = false;
             }
         }
@@ -18071,6 +18155,12 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 ggml_get_op_params_i32(graph->nodes[start + 2], 1) == GGML_HINT_SRC0_IS_HADAMARD;
         };
 
+        // a GLU right before such a transform is fused into it too (ggml_vk_can_fuse_fwht_glu)
+        auto const &is_fwht_glu_at = [&](int start) -> bool {
+            return match_pattern({ GGML_OP_GLU }, start) && is_fwht_signed_at(start + 1) &&
+                (graph->nodes[start + 1]->src[0] == graph->nodes[start] || graph->nodes[start + 1]->src[1] == graph->nodes[start]);
+        };
+
         auto const &keep_pattern = [&](const std::initializer_list<ggml_op> &pattern) -> bool {
             if (match_pattern(pattern, first_unused)) {
                 for (size_t j = 0; j < pattern.size(); ++j) {
@@ -18104,6 +18194,9 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         if (keep_pattern(snake_pattern)) {
             continue;
         }
+        if (ctx->device->keep_fwht_signed && is_fwht_glu_at(first_unused) && keep_pattern({ GGML_OP_GLU, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT })) {
+            continue;
+        }
         if (ctx->device->keep_fwht_signed && is_fwht_signed_at(first_unused) && keep_pattern({ GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT })) {
             continue;
         }
@@ -18132,7 +18225,7 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 match_pattern(topk_moe_early_softmax, j) ||
                 match_pattern(topk_moe_late_softmax, j) ||
                 match_pattern(snake_pattern, j) ||
-                (ctx->device->keep_fwht_signed && is_fwht_signed_at(j))) {
+                (ctx->device->keep_fwht_signed && (is_fwht_signed_at(j) || is_fwht_glu_at(j)))) {
                 continue;
             }
             bool ok = true;
