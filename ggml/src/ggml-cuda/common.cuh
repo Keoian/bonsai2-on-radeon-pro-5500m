@@ -1313,7 +1313,8 @@ static inline ggml_cuda_q8_1_layout ggml_cuda_q8_1_layout_host(ggml_type type_sr
     }
     if (l == GGML_CUDA_Q8_1_SOA_ISUM) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-        if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING && cc < GGML_CUDA_CC_ADA_LOVELACE) {
+        // Pascal: PT at one column is 1.3-2x faster than SoA (GTX 1070, tg 16.8 -> 21.4 t/s)
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && ((cc >= GGML_CUDA_CC_TURING && cc < GGML_CUDA_CC_ADA_LOVELACE) || (cc >= GGML_CUDA_CC_PASCAL && cc < GGML_CUDA_CC_VOLTA))) {
             return GGML_CUDA_Q8_1_PT;
         }
     }
