@@ -2893,7 +2893,7 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
     static const bool pq2_enabled = getenv("GGML_CUDA_FWHT_FUSION_PQ2") != nullptr &&
                                     atoi(getenv("GGML_CUDA_FWHT_FUSION_PQ2")) != 0;
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_TURING) {
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_PASCAL || (cc >= GGML_CUDA_CC_VOLTA && cc < GGML_CUDA_CC_TURING)) {
         return 0; // the PTQ1_0 mmvq predicate below is only meaningful there
     }
 
