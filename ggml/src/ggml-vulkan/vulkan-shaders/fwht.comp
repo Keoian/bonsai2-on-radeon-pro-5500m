@@ -13,6 +13,9 @@
 #extension GL_KHR_shader_subgroup_clustered : require
 #include "types.glsl"
 #endif
+#ifdef FWHT_NORM
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 32;
 layout(constant_id = 1) const uint N = 128;
@@ -34,6 +37,12 @@ layout(push_constant) uniform parameter
     float scale;
 #ifdef FWHT_GLU
     uint glu_offset;
+#endif
+#ifdef FWHT_NORM
+    uint norm_ne;
+    float norm_eps;
+    uint w_offset;
+    uint normed_offset;
 #endif
 };
 
@@ -62,6 +71,18 @@ layout(binding = 4, std430) readonly buffer U { float data_u[]; };
 #else
 layout(binding = 3, std430) readonly buffer U { float data_u[]; };
 #endif
+#endif
+#ifdef FWHT_NORM
+// FWHT_NORM (with FWHT_SIGNED and FWHT_WIDE): the row is rms_norm(data_a) * data_w over norm rows of norm_ne elements (a multiple of N).
+// Each workgroup sums the squares of its whole norm row, and also writes its part of the normed row to data_normed.
+#ifdef FWHT_Q8
+layout(binding = 4, std430) readonly buffer W { float data_w[]; };
+layout(binding = 5, std430) writeonly buffer NO { float data_normed[]; };
+#else
+layout(binding = 3, std430) readonly buffer W { float data_w[]; };
+layout(binding = 4, std430) writeonly buffer NO { float data_normed[]; };
+#endif
+shared float norm_sh[BLOCK_SIZE];
 #endif
 
 const uint EL_W = N / BLOCK_SIZE;
@@ -99,9 +120,47 @@ void main() {
 
         float reg[EL_W];
 
+#ifdef FWHT_NORM
+        // the same formula as rms_norm.comp: scale = 1 / sqrt(mean(x^2) + eps), normed = scale * x * w
+        const uint norm_base = (row_offset / norm_ne) * norm_ne;
+        // 8 loads in flight per invocation
+        float ssv[8] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+        uint c = tid;
+        for (; c + 7 * BLOCK_SIZE < norm_ne; c += 8 * BLOCK_SIZE) {
+            [[unroll]]
+            for (uint k = 0; k < 8; ++k) {
+                const float v = float(data_a[src_offset + norm_base + c + k * BLOCK_SIZE]);
+                ssv[k] += v * v;
+            }
+        }
+        for (; c < norm_ne; c += BLOCK_SIZE) {
+            const float v = float(data_a[src_offset + norm_base + c]);
+            ssv[0] += v * v;
+        }
+        float ss = ((ssv[0] + ssv[1]) + (ssv[2] + ssv[3])) + ((ssv[4] + ssv[5]) + (ssv[6] + ssv[7]));
+        ss = subgroupAdd(ss);
+        if (gl_SubgroupInvocationID == 0) {
+            norm_sh[gl_SubgroupID] = ss;
+        }
+        barrier();
+        ss = 0.0;
+        for (uint sg = 0; sg < gl_NumSubgroups; ++sg) {
+            ss += norm_sh[sg];
+        }
+        barrier();
+        const float norm_scale = inversesqrt(ss / float(norm_ne) + norm_eps);
+#endif
+
         [[unroll]]
         for (uint i = 0; i < EL_W; ++i) {
-#if defined(FWHT_GLU)
+#if defined(FWHT_NORM)
+            {
+                const uint e = row_offset + i * BLOCK_SIZE + tid;
+                const float x = norm_scale * float(data_a[src_offset + e]) * data_w[w_offset + (e - norm_base)];
+                data_normed[normed_offset + e] = x;
+                reg[i] = x * data_s[signs_offset + (row_offset % signs_ne) + i * BLOCK_SIZE + tid] * scale;
+            }
+#elif defined(FWHT_GLU)
             if (row < n_rows) {
                 const float g = float(data_a[src_offset + row_offset + i * BLOCK_SIZE + tid]);
                 const float x = g / (1.0f + exp(-g)) * data_u[glu_offset + row_offset + i * BLOCK_SIZE + tid];
