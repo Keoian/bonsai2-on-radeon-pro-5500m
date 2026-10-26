@@ -1131,6 +1131,7 @@ struct vk_device_struct {
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
     bool disable_fa_vec;
+    bool disable_ptq1_0_w32;
 
     std::unique_ptr<vk_memory_logger> memory_logger;
 
@@ -5421,7 +5422,15 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 // PTQ1_0: 4 rows per workgroup; the 4th constant is the column group size of the multi-column path
                 // (3 on RDNA2; 2 is 13% faster at 4 and 8 columns on RDNA1 and the same at 2, 3 and 5)
                 const uint32_t ptq1_0_cg = device->architecture == AMD_RDNA1 ? 2 : 3;
-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_PTQ1_0][i], "mul_mat_vec_ptq1_0_q8_1_f32", arr_dmmv_ptq1_0_q8_1_f32_len[reduc], arr_dmmv_ptq1_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {4*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 4*rm_kq_int, i+1, ptq1_0_cg}, 1, true, use_subgroups, subgroup_size_int);
+                // PTQ1_0 on RDNA1 for 1-2 columns: one wave32 workgroup, 4 rows of 8 lanes, mask-free decode shared by the columns (mul_mat_vecq_ptq1_0_w32.comp).
+                // More columns would not fit in registers.
+                const bool ptq1_0_w32 = i < 2 && device->architecture == AMD_RDNA1 && !device->disable_ptq1_0_w32 && device->subgroup_clustered &&
+                                        device->subgroup_size_control && device->subgroup_min_size <= 32 && device->subgroup_max_size >= 32;
+                if (ptq1_0_w32) {
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_PTQ1_0][i], "mul_mat_vec_ptq1_0_q8_1_f32_w32", mul_mat_vec_ptq1_0_q8_1_f32_w32_len, mul_mat_vec_ptq1_0_q8_1_f32_w32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {4, 1, 1}, {32, 4, i+1}, 1, true, true, 32);
+                } else {
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_PTQ1_0][i], "mul_mat_vec_ptq1_0_q8_1_f32", arr_dmmv_ptq1_0_q8_1_f32_len[reduc], arr_dmmv_ptq1_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {4*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 4*rm_kq_int, i+1, ptq1_0_cg}, 1, true, use_subgroups, subgroup_size_int);
+                }
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_PQ2_0][i], "mul_mat_vec_pq2_0_q8_1_f32", arr_dmmv_pq2_0_q8_1_f32_len[reduc], arr_dmmv_pq2_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_q8_1_f32", arr_dmmv_q4_0_q8_1_f32_len[reduc], arr_dmmv_q4_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_1][i], "mul_mat_vec_q4_1_q8_1_f32", arr_dmmv_q4_1_q8_1_f32_len[reduc], arr_dmmv_q4_1_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
@@ -6381,6 +6390,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->disable_graph_optimize = GGML_VK_DISABLE_GRAPH_OPTIMIZE != nullptr;
 
         device->disable_fa_vec = getenv("GGML_VK_DISABLE_FA_VEC") != nullptr;
+        device->disable_ptq1_0_w32 = getenv("GGML_VK_DISABLE_PTQ1_0_W32") != nullptr;
 
         bool fp16_storage = false;
         bool fp16_compute = false;

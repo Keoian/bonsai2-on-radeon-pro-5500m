@@ -1,0 +1,182 @@
+#version 450
+
+// PTQ1_0 x q8_1 mat-vec for wave32 (RDNA), 1 or 2 columns. One row per 8 lanes; each lane takes whole 128-element blocks and decodes each block once for all columns.
+//
+// Decode without masks: for a byte v in a 16-bit lane, the high byte of v * 3^(k+1) is u_k = floor(v * 3^(k+1) / 256), and trit k is t_k = u_k - 3 * u_(k-1).
+// This is true for all 243 codes, and v * 243 < 65536. So per qs dword and level, two 24-bit multiplies give u_k of its 4 bytes (bytes 0,2 and 1,3 in 16-bit lanes),
+// and one byte permute packs them in byte order. Then T_k = U_k - 3 * U_(k-1) as a dword: 3 * u_(k-1) <= 240 and each byte of the difference is t_k >= 0,
+// so no carry or borrow crosses a byte. T_k is in byte order, so it dots with a plain q8_1 dword.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+
+#define B_TYPE block_q8_1_x4
+
+#include "mul_mat_vec_base.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// A: 7 dwords per block: w[0..5] = qs[0..23], w[6] = qh[0] | qh[1] << 8 | d << 16
+// B: 9 uvec4 per block_q8_1_x4: ds[4] (f16 d, f16 s), then 32 dwords of int8x4 in element order
+layout (binding = 0) readonly buffer A_U32  {uint32_t data_a_u32[];};
+layout (binding = 1) readonly buffer B_U128 {uvec4    data_b_u128[];};
+
+#define PTQ1_0_DWORDS   7u
+#define Q8_1_X4_UVEC4   9u
+
+const uint LANES_PER_ROW = 8;   // NUM_ROWS = BLOCK_SIZE / LANES_PER_ROW
+
+#define DOT4(a, b, acc) dotPacked4x8AccSatEXT(int32_t(a), int32_t(b), acc)
+
+// t_0 .. t_4 of the 4 bytes of a qs dword: va holds bytes 0,2 and vb bytes 1,3 in 16-bit lanes
+#define U_LEVEL(c) ((((va * (c)) >> 8u) & 0x00FF00FFu) | ((vb * (c)) & 0xFF00FF00u))
+void qs_t(const uint w, out uint t0, out uint t1, out uint t2, out uint t3, out uint t4) {
+    const uint va = w & 0x00FF00FFu;
+    const uint vb = (w >> 8u) & 0x00FF00FFu;
+    const uint u0 = U_LEVEL(3u);
+    const uint u1 = U_LEVEL(9u);
+    const uint u2 = U_LEVEL(27u);
+    const uint u3 = U_LEVEL(81u);
+    t0 = u0;
+    t1 = u1 - u0 * 3u;
+    t2 = u2 - u1 * 3u;
+    t3 = u3 - u2 * 3u;
+    t4 = U_LEVEL(243u) - u3 * 3u;
+}
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint slot = lane % LANES_PER_ROW;
+    const uint row  = lane / LANES_PER_ROW;
+
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+    if (first_row >= p.stride_d) {
+        return;
+    }
+
+    uint a_offset, b_offset, d_offset;
+    get_offsets(a_offset, b_offset, d_offset);
+
+    const uint nb = p.ncols / QUANT_K;
+
+    uint bcol[NUM_COLS];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        // one block_q8_1_x4 covers exactly the 128 activations of one block
+        bcol[j] = (j * p.batch_stride_b + b_offset) / QUANT_K;
+    }
+
+    // Rows past the matrix (last workgroup) reread the last valid row and are not stored.
+    const uint arow = (a_offset + min(first_row + row, p.stride_d - 1u) * nb) * PTQ1_0_DWORDS;
+
+    float temp[NUM_COLS];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        temp[j] = 0.0;
+    }
+
+    for (uint blk = slot; blk < nb; blk += LANES_PER_ROW) {
+        uint w[PTQ1_0_DWORDS];
+        [[unroll]] for (uint d = 0; d < PTQ1_0_DWORDS; ++d) {
+            w[d] = data_a_u32[arow + blk * PTQ1_0_DWORDS + d];
+        }
+
+        uint y[NUM_COLS][32];
+        vec4 dq[NUM_COLS];
+        float kblk[NUM_COLS];
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint bq = (bcol[j] + blk) * Q8_1_X4_UVEC4;
+            const uvec4 dsraw = data_b_u128[bq];
+            [[unroll]] for (uint q = 0; q < 8; ++q) {
+                const uvec4 v = data_b_u128[bq + 1u + q];
+                y[j][4u*q] = v.x; y[j][4u*q + 1u] = v.y; y[j][4u*q + 2u] = v.z; y[j][4u*q + 3u] = v.w;
+            }
+            const vec2 ds0 = unpackHalf2x16(dsraw.x);
+            const vec2 ds1 = unpackHalf2x16(dsraw.y);
+            const vec2 ds2 = unpackHalf2x16(dsraw.z);
+            const vec2 ds3 = unpackHalf2x16(dsraw.w);
+            dq[j] = vec4(ds0.x, ds1.x, ds2.x, ds3.x);
+            // the ternary offset: minus sum(q8) of the whole block
+            kblk[j] = -((ds0.y + ds1.y) + (ds2.y + ds3.y));
+        }
+
+        // sum(t * q8) per column and q8_1 sub-block
+        int32_t acc[NUM_COLS][4];
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            [[unroll]] for (uint s = 0; s < 4; ++s) {
+                acc[j][s] = 0;
+            }
+        }
+
+        uint t0, t1, t2, t3, t4;
+        // qs bytes 0..15: byte j holds elements 16k + j, so dword d at level k is y[4k + d]; sub-blocks 0,0,1,1,2
+        [[unroll]] for (uint d = 0; d < 4; ++d) {
+            qs_t(w[d], t0, t1, t2, t3, t4);
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                acc[j][0] = DOT4(t0, y[j][d],       acc[j][0]);
+                acc[j][0] = DOT4(t1, y[j][4u + d],  acc[j][0]);
+                acc[j][1] = DOT4(t2, y[j][8u + d],  acc[j][1]);
+                acc[j][1] = DOT4(t3, y[j][12u + d], acc[j][1]);
+                acc[j][2] = DOT4(t4, y[j][16u + d], acc[j][2]);
+            }
+        }
+        // qs bytes 16..23: byte 16 + j holds elements 80 + 8k + j, so dword 4 + d at level k is y[20 + 2k + d]; sub-blocks 2,2,3,3,3
+        [[unroll]] for (uint d = 0; d < 2; ++d) {
+            qs_t(w[4u + d], t0, t1, t2, t3, t4);
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                acc[j][2] = DOT4(t0, y[j][20u + d], acc[j][2]);
+                acc[j][2] = DOT4(t1, y[j][22u + d], acc[j][2]);
+                acc[j][3] = DOT4(t2, y[j][24u + d], acc[j][3]);
+                acc[j][3] = DOT4(t3, y[j][26u + d], acc[j][3]);
+                acc[j][3] = DOT4(t4, y[j][28u + d], acc[j][3]);
+            }
+        }
+
+        // qh: 4 trit levels of 2 bytes, level k -> elements 120 + 2k + h (sub-block 3). Bytes 1,3 of qk are u_k of qh[0], qh[1].
+        {
+            const uint vq = (w[6] & 0xFFu) | ((w[6] & 0xFF00u) << 8u);
+            const uint q0 = vq * 3u;
+            const uint q1 = vq * 9u;
+            const uint q2 = vq * 27u;
+            const uint q3 = vq * 81u;
+            // u of levels 0,1 and 2,3, and u of the level before each (0 before level 0)
+            const uint u01 = ((q0 >> 8u) & 0xFFu) | ((q0 >> 16u) & 0xFF00u) | ((q1 << 8u) & 0xFF0000u) | (q1 & 0xFF000000u);
+            const uint u23 = ((q2 >> 8u) & 0xFFu) | ((q2 >> 16u) & 0xFF00u) | ((q3 << 8u) & 0xFF0000u) | (q3 & 0xFF000000u);
+            const uint p01 = ((q0 << 8u) & 0xFF0000u) | (q0 & 0xFF000000u);
+            const uint p23 = ((q1 >> 8u) & 0xFFu) | ((q1 >> 16u) & 0xFF00u) | ((q2 << 8u) & 0xFF0000u) | (q2 & 0xFF000000u);
+            const uint t01 = u01 - p01 * 3u;
+            const uint t23 = u23 - p23 * 3u;
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                acc[j][3] = DOT4(t01, y[j][30], acc[j][3]);
+                acc[j][3] = DOT4(t23, y[j][31], acc[j][3]);
+            }
+        }
+
+        const float da = unpackHalf2x16(w[6]).y;
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const float sum = fma(dq[j].x, float(acc[j][0]),
+                              fma(dq[j].y, float(acc[j][1]),
+                              fma(dq[j].z, float(acc[j][2]),
+                              fma(dq[j].w, float(acc[j][3]), kblk[j]))));
+            temp[j] = fma(da, sum, temp[j]);
+        }
+    }
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        temp[j] = subgroupClusteredAdd(temp[j], LANES_PER_ROW);
+    }
+
+    if (slot == 0 && first_row + row < p.stride_d) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint di = j * p.batch_stride_d + d_offset + first_row + row;
+            float r = temp[j];
+            if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
+                r += float(data_fuse0[di]);
+            }
+            if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
+                r += float(data_fuse1[di]);
+            }
+            data_d[di] = D_TYPE(r);
+        }
+    }
+}
