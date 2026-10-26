@@ -553,6 +553,7 @@ enum FaCodePath {
     FA_SCALAR,
     FA_COOPMAT1,
     FA_COOPMAT2,
+    FA_VEC,
 };
 
 struct vk_fa_pipeline_state {
@@ -1129,6 +1130,7 @@ struct vk_device_struct {
     bool disable_host_visible_vidmem;
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
+    bool disable_fa_vec;
 
     std::unique_ptr<vk_memory_logger> memory_logger;
 
@@ -3753,6 +3755,41 @@ static bool ggml_vk_fa_xor32_shmem(const vk_device& device, const vk_fa_tuning_p
 
 static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type = GGML_TYPE_F16, ggml_type v_type = GGML_TYPE_F16);
 
+// Decode FA for a q8_0 K / q4_0 V cache with head size 256 and up to 8 GQA rows, see flash_attn_vec.comp. Tested on RDNA1.
+static bool ggml_vk_fa_vec_supported(const vk_device& device, const ggml_tensor * dst, uint32_t gqa_ratio) {
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    float max_bias, logit_softcap;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    const bool subgroup32 = device->subgroup_size == 32 || (device->subgroup_size_control && device->subgroup_min_size <= 32 && device->subgroup_max_size >= 32);
+    return !device->disable_fa_vec && device->vendor_id == VK_VENDOR_ID_AMD && subgroup32 && device->integer_dot_product &&
+           device->subgroup_clustered && device->subgroup_shuffle && device->subgroup_ballot && device->subgroup_vote &&
+           k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q4_0 && k->ne[0] == 256 && v->ne[0] == 256 &&
+           gqa_ratio > 1 && gqa_ratio <= 8 && dst->src[4] == nullptr && max_bias == 0.0f && logit_softcap == 0.0f &&
+           k->nb[1] % 4 == 0 && k->nb[2] % 4 == 0 && k->nb[3] % 4 == 0;
+#else
+    GGML_UNUSED(device);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(gqa_ratio);
+    return false;
+#endif
+}
+
+static vk_fa_tuning_params get_fa_tuning_params_vec(uint32_t gqa_ratio) {
+    vk_fa_tuning_params result{};
+    result.path = FA_VEC;
+    result.workgroup_size = 32;
+    result.subgroup_size = 32;
+    result.block_rows = gqa_ratio;
+    result.block_cols = 4;
+    result.d_split = 1;
+    result.row_split = 1;
+    return result;
+}
+
 static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
 
     vk_fa_tuning_params result{};
@@ -4557,6 +4594,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                 get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
                                 !fa_ds, !fa_ds ? fa_sgs : 0);
     }
+
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+    for (auto &fa : device->pipeline_flash_attn_f32_f16) {
+        if (fa.first.path != FA_VEC) continue;
+        ggml_vk_create_pipeline(device, fa.second, "flash_attn_vec_q8_0_q4_0", flash_attn_vec_q8_0_q4_0_len, flash_attn_vec_q8_0_q4_0_data, "main", 7,
+                                sizeof(vk_flash_attn_push_constants), {fa.first.Br, 1, 1},
+                                get_fa_spec_constants(fa.first), fa.first.aligned ? fa.first.Bc : 1, true,
+                                true, fa.first.subgroup_size);
+    }
+#endif
 
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     if (device->coopmat1_fa_support) {
@@ -6332,6 +6379,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         const char* GGML_VK_DISABLE_GRAPH_OPTIMIZE = getenv("GGML_VK_DISABLE_GRAPH_OPTIMIZE");
         device->disable_graph_optimize = GGML_VK_DISABLE_GRAPH_OPTIMIZE != nullptr;
+
+        device->disable_fa_vec = getenv("GGML_VK_DISABLE_FA_VEC") != nullptr;
 
         bool fp16_storage = false;
         bool fp16_compute = false;
@@ -11129,6 +11178,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 
     tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
+    if (!use_dequant_kv && ggml_vk_fa_vec_supported(ctx->device, dst, gqa_ratio)) {
+        tuning_params = get_fa_tuning_params_vec(gqa_ratio);
+    }
 
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
@@ -11177,7 +11229,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
     bool use_mask_opt = mask && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
-                        && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
+                        && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256)
+                        && tuning_params.path != FA_VEC;
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff);
 
@@ -11214,7 +11267,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const uint32_t Tr = CEIL_DIV(N, Br);
 
     // Try to use split_k when KV is large enough to be worth the overhead.
-    if (gqa_ratio > 1 && workgroups_x <= Br) {
+    if (tuning_params.path == FA_VEC) {
+        // one subgroup per workgroup: about 8 workgroups per CU, and at least 32 KV columns per split
+        split_k = std::max(1u, std::min(shader_core_count * 8 / (workgroups_x * workgroups_y * workgroups_z), KV / 32));
+    } else if (gqa_ratio > 1 && workgroups_x <= Br) {
         split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
         uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;

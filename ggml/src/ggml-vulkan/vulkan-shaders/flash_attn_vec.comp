@@ -1,0 +1,218 @@
+#version 450
+
+// Decode flash attention for a q8_0 K / q4_0 V cache with head size 256: one subgroup of 32 per workgroup, all GQA rows of one token.
+// Each step takes Bc = 4 KV columns. QK: 8 lanes per column, one q8_0 block per lane, int8 dot with Q quantized once to registers.
+// PV: each lane owns 8 output dims (4 low and 4 high nibbles of one q4_0 block) for all rows, so each K/V byte is decoded once.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_vote : enable
+
+#include "types.glsl"
+#include "flash_attn_base.glsl"
+
+// The host sets HSK = HSV = 256, WorkGroupSize = 32 and Bc = COLS.
+const uint32_t R = Br;                 // GQA rows of the token
+const uint32_t K_LANES = 8;            // q8_0 blocks per K row, one lane each
+const uint32_t K_DWORDS = 9;           // dword window that holds the 32 qs bytes of one q8_0 block
+const uint32_t V_DIMS = 8;             // output dims per lane
+const uint32_t COLS = 4;               // KV columns per step, == Bc
+
+layout (binding = 0) readonly buffer QV4 {vec4 data_qv4[];};
+layout (binding = 1) readonly buffer K32 {uint data_k32[];};
+layout (binding = 2) readonly buffer V16 {uint16_t data_v16[];};
+layout (binding = 3) readonly buffer M16 {uint16_t data_m16[];};
+
+uint k_base, k_col, v_base, v_col, m_offset;
+
+// Raw K, V and mask data of one step. The loop loads the next step into these while it computes the current one.
+uint kd[K_DWORDS], kdw, mraw;
+uint vlo[COLS], vhi[COLS], vd[COLS];
+
+void load_step(const uint j, const uint cc, const uint vq, const bool k_shift) {
+    const uint c_k = KV_bounds_check ? min(j * COLS + cc, KV - 1) : j * COLS + cc;
+    const uint kq = k_base + c_k * k_col;
+    const uint kw = kq / 4;
+    [[unroll]] for (uint i = 0; i < K_DWORDS - 1; ++i) {
+        kd[i] = data_k32[kw + i];
+    }
+    // the last dword only holds data for even blocks; odd blocks reread one inside the row
+    kd[K_DWORDS - 1] = data_k32[kw + (k_shift ? K_DWORDS - 1 : K_DWORDS - 2)];
+    kdw = data_k32[(kq - 2) / 4];
+    mraw = MASK_ENABLE ? uint(data_m16[m_offset + c_k]) : 0;
+
+    [[unroll]] for (uint c = 0; c < COLS; ++c) {
+        const uint c_v = KV_bounds_check ? min(j * COLS + c, KV - 1) : j * COLS + c;
+        const uint vo = v_base + c_v * v_col;
+        vd[c] = uint(data_v16[vo]);
+        vlo[c] = uint(data_v16[vo + 1 + 2 * vq]);
+        vhi[c] = uint(data_v16[vo + 2 + 2 * vq]);
+    }
+}
+
+void main() {
+    init_indices();
+
+    const uint lane = gl_SubgroupInvocationID;
+    const uint cc = lane / K_LANES;    // QK: column in the step
+    const uint kb = lane % K_LANES;    // QK: q8_0 block
+    const uint vb = lane / 4;          // PV: q4_0 block
+    const uint vq = lane % 4;          // PV: qs dword in the block
+
+    const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
+    const float NEG_INF = uintBitsToFloat(0xFF800000);
+
+    // K bytes of block kb start 2 bytes into a dword for even kb (4-aligned rows), so Q is shifted by the same 2 bytes and dotted with 9 whole dwords.
+    const uint q_offset = gqa_iq1*p.nb01 + (iq2*p.nb02 + iq3*p.nb03) / 4;
+    const bool k_shift = (kb & 1) == 0;
+    int32_t qs[R][K_DWORDS];
+    float qd[R];
+    [[unroll]] for (uint r = 0; r < R; ++r) {
+        vec4 qv[8];
+        float amax = 0.0;
+        [[unroll]] for (uint i = 0; i < 8; ++i) {
+            qv[i] = r < N ? data_qv4[q_offset / 4 + r * q_stride / 4 + kb * 8 + i] * p.scale : vec4(0.0);
+            const vec4 a = abs(qv[i]);
+            amax = max(amax, max(max(a.x, a.y), max(a.z, a.w)));
+        }
+        qd[r] = amax / 127.0;
+        const float id = qd[r] != 0.0 ? 1.0 / qd[r] : 0.0;
+        uint q[8];
+        [[unroll]] for (uint i = 0; i < 8; ++i) {
+            q[i] = pack32(i8vec4(round(qv[i] * id)));
+        }
+        [[unroll]] for (uint i = 0; i < K_DWORDS; ++i) {
+            const uint lo = i > 0 ? q[i - 1] : 0;
+            const uint hi = i < 8 ? q[i] : 0;
+            qs[r][i] = int32_t(k_shift ? (lo >> 16) | (hi << 16) : hi);
+        }
+    }
+
+    float O[R][V_DIMS];
+    [[unroll]] for (uint r = 0; r < R; ++r) {
+        [[unroll]] for (uint d = 0; d < V_DIMS; ++d) {
+            O[r][d] = 0.0;
+        }
+    }
+    // lane (cc, kb) keeps the softmax state of row kb
+    float M_own = NEG_FLT_MAX_OVER_2;
+    float L_own = 0.0;
+
+    k_base = ik2*p.nb12 + ik3*p.nb13 + kb * FaBlockBytesK + 2;
+    k_col = p.nb11 * FaBlockBytesK;
+    v_base = (iv2*p.nb22 + iv3*p.nb23 + vb * FaBlockBytesV) / 2;
+    v_col = p.nb21 * FaBlockBytesV / 2;
+    m_offset = gqa_iq1*KV + (p.nem2 != 1 || p.nem3 != 1 ? ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 * KV : 0);
+
+    if (start_j < end_j) {
+        load_step(start_j, cc, vq, k_shift);
+    }
+
+    [[dont_unroll]]
+    for (uint32_t j = start_j; j < end_j; ++j) {
+        const uint ck[K_DWORDS] = kd;
+        const float dk = unpackHalf2x16(kdw)[k_shift ? 0 : 1];
+        float mval = MASK_ENABLE ? unpackHalf2x16(mraw).x : 0.0;
+        if (KV_bounds_check && j * COLS + cc >= KV) {
+            mval = NEG_INF;
+        }
+        const uint cvlo[COLS] = vlo;
+        const uint cvhi[COLS] = vhi;
+        const uint cvd[COLS] = vd;
+
+        load_step(min(j + 1, end_j - 1), cc, vq, k_shift);
+
+        // S for every row of column cc, summed over the K_LANES lanes of the column
+        float S[R];
+        [[unroll]] for (uint r = 0; r < R; ++r) {
+            int32_t acc = 0;
+            [[unroll]] for (uint i = 0; i < K_DWORDS; ++i) {
+                acc += dotPacked4x8EXT(qs[r][i], int32_t(ck[i]));
+            }
+            S[r] = subgroupClusteredAdd(float(acc) * (qd[r] * dk), K_LANES) + mval;
+        }
+
+        float s_own = NEG_INF;
+        [[unroll]] for (uint r = 0; r < R; ++r) {
+            if (kb == r) {
+                s_own = S[r];
+            }
+        }
+        float m_step = s_own;
+        [[unroll]] for (uint s = K_LANES; s < WorkGroupSize; s *= 2) {
+            m_step = max(m_step, subgroupShuffleXor(m_step, s));
+        }
+        const float m_new = max(M_own, m_step);
+        if (subgroupAny(m_new > M_own)) {
+            const float eM = exp(M_own - m_new);
+            L_own *= eM;
+            M_own = m_new;
+            [[unroll]] for (uint r = 0; r < R; ++r) {
+                const float e = subgroupBroadcast(eM, r);
+                [[unroll]] for (uint d = 0; d < V_DIMS; ++d) {
+                    O[r][d] *= e;
+                }
+            }
+        }
+        const float P_own = exp(s_own - M_own);
+        L_own += P_own;
+
+        [[unroll]] for (uint c = 0; c < COLS; ++c) {
+            const uint x = cvlo[c] | (cvhi[c] << 16);
+            const uint xl = x & 0x0F0F0F0F;
+            const uint xh = (x >> 4) & 0x0F0F0F0F;
+            const float dv = unpackHalf2x16(cvd[c]).x;
+            const float nd = -8.0 * dv;
+            float v[V_DIMS];
+            [[unroll]] for (uint i = 0; i < 4; ++i) {
+                v[i]     = fma(float((xl >> (8 * i)) & 0xFF), dv, nd);
+                v[i + 4] = fma(float((xh >> (8 * i)) & 0xFF), dv, nd);
+            }
+            [[unroll]] for (uint r = 0; r < R; ++r) {
+                const float P = subgroupBroadcast(P_own, c * K_LANES + r);
+                [[unroll]] for (uint d = 0; d < V_DIMS; ++d) {
+                    O[r][d] = fma(P, v[d], O[r][d]);
+                }
+            }
+        }
+    }
+
+    float L = L_own;
+    [[unroll]] for (uint s = K_LANES; s < WorkGroupSize; s *= 2) {
+        L += subgroupShuffleXor(L, s);
+    }
+
+    // dims of this lane: vb*32 + 4*vq + [0,4) and vb*32 + 16 + 4*vq + [0,4)
+    const uint d_lo = (vb * 32 + 4 * vq) / 4;
+    const uint d_hi = d_lo + 4;
+
+    if (p.k_num > 1) {
+        const uint o_offset = HSV * p.ne1 * (split_k_index + p.k_num * (gqa_iq1 + p.ne2 * iq3)) / 4;
+        [[unroll]] for (uint r = 0; r < R; ++r) {
+            if (r < N) {
+                data_ov4[o_offset + (iq2 + r) * HSV / 4 + d_lo] = vec4(O[r][0], O[r][1], O[r][2], O[r][3]);
+                data_ov4[o_offset + (iq2 + r) * HSV / 4 + d_hi] = vec4(O[r][4], O[r][5], O[r][6], O[r][7]);
+            }
+        }
+        const uint lm_offset = HSV * p.ne1 * p.k_num * p.ne2 * p.ne3 + p.ne1 * 2 * (split_k_index + p.k_num * (gqa_iq1 + p.ne2 * iq3));
+        if (cc == 0 && kb < N) {
+            data_o[lm_offset + iq2 + kb] = L;
+            data_o[lm_offset + p.ne1 + iq2 + kb] = M_own;
+        }
+        return;
+    }
+
+    const uint o_offset = (gqa_iq1*p.ne1*HSV + iq3*p.ne2*p.ne1*HSV) / 4;
+    [[unroll]] for (uint r = 0; r < R; ++r) {
+        const float Lr = subgroupBroadcast(L, r);
+        const float Linv = Lr == 0.0 ? 0.0 : 1.0 / Lr;
+        if (r < N) {
+            data_ov4[o_offset + (iq2 + r) * HSV / 4 + d_lo] = vec4(O[r][0], O[r][1], O[r][2], O[r][3]) * Linv;
+            data_ov4[o_offset + (iq2 + r) * HSV / 4 + d_hi] = vec4(O[r][4], O[r][5], O[r][6], O[r][7]) * Linv;
+        }
+    }
+}

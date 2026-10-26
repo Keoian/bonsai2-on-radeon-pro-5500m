@@ -882,6 +882,9 @@ void process_shaders() {
 
     string_to_spv("split_k_reduce", "mul_mat_split_k_reduce.comp", {});
     string_to_spv("fa_split_k_reduce", "flash_attn_split_k_reduce.comp", {});
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+    string_to_spv("flash_attn_vec_q8_0_q4_0", "flash_attn_vec.comp", {{"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"ACC_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV4", "vec4"}});
+#endif
 
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
 
