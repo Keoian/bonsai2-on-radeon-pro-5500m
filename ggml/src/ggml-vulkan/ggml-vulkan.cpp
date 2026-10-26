@@ -2496,6 +2496,8 @@ struct ggml_backend_vk_context {
     bool fused_dn_gates {};
     // set when the current node leads a gated norm + regroup + signed FWHT fusion (ggml_vk_can_fuse_fwht_gnorm)
     bool fused_fwht_gnorm {};
+    // set when the fusion writes its last node only after a barrier, so that node may overlap the fusion's inputs
+    bool fused_last_after_barrier {};
     bool fused_gdn_set_rows {};
 
     // for GGML_VK_PERF_LOGGER
@@ -10795,7 +10797,12 @@ static bool ggml_vk_can_fuse_dn_gates(const ggml_backend_vk_context * ctx, const
         !ggml_is_contiguous(n[4]) || !ggml_is_contiguous(n[8])) {
         return false;
     }
-    if (ggml_vk_any_overlap({ n[4], n[8] }, { x, wa, wb, bias, sa })) {
+    if (ggml_vk_any_overlap({ n[4] }, { x, wa, wb, bias, sa })) {
+        return false;
+    }
+    // beta (the last node) often lands on x, which is dead after the beta mat-vec in node order: then the kernel writes beta to that
+    // mat-vec's own (elided) output, allocated while x was alive, and ggml_vk_dn_gates copies it after a barrier
+    if (ggml_vk_any_overlap({ n[8] }, { x, wa, wb, bias, sa }) && (!ggml_is_contiguous(n[6]) || ggml_vk_any_overlap({ n[6] }, { x, wa, wb, bias, sa, n[4] }))) {
         return false;
     }
     // the weights are read as bf16 pairs
@@ -10813,6 +10820,9 @@ static void ggml_vk_dn_gates(ggml_backend_vk_context * ctx, vk_context& subctx, 
     const ggml_tensor * sa   = n[4]->src[0] == n[3] ? n[4]->src[1] : n[4]->src[0];
     const ggml_tensor * gate = n[4];
     const ggml_tensor * beta = n[8];
+    // see ggml_vk_can_fuse_dn_gates
+    const bool beta_tmp = ggml_vk_any_overlap({ beta }, { x, wa, wb, bias, sa });
+    const ggml_tensor * beta_out = beta_tmp ? mb : beta;
 
     const uint32_t K = (uint32_t)wa->ne[0];
     const uint32_t R = (uint32_t)wa->ne[1];
@@ -10827,14 +10837,23 @@ static void ggml_vk_dn_gates(ggml_backend_vk_context * ctx, vk_context& subctx, 
         (uint32_t)(get_misalign_bytes(ctx, wa) / 4), (uint32_t)(get_misalign_bytes(ctx, wb) / 4),
         (uint32_t)(get_misalign_bytes(ctx, bias) / sizeof(float)), (uint32_t)(get_misalign_bytes(ctx, sa) / sizeof(float)),
         (uint32_t)(get_misalign_bytes(ctx, gate) / sizeof(float)), R,
-        (uint32_t)(get_misalign_bytes(ctx, beta) / sizeof(float)), R,
+        (uint32_t)(get_misalign_bytes(ctx, beta_out) / sizeof(float)), R,
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
             ggml_vk_tensor_subbuffer(ctx, x, true), ggml_vk_tensor_subbuffer(ctx, wa, true), ggml_vk_tensor_subbuffer(ctx, wb, true),
             ggml_vk_tensor_subbuffer(ctx, bias, true), ggml_vk_tensor_subbuffer(ctx, sa, true),
-            ggml_vk_tensor_subbuffer(ctx, gate, true), ggml_vk_tensor_subbuffer(ctx, beta, true),
+            ggml_vk_tensor_subbuffer(ctx, gate, true), ggml_vk_tensor_subbuffer(ctx, beta_out, true),
         }, pc, { 2 * R, M, 1 });
+
+    if (beta_tmp) {
+        ggml_vk_sync_buffers(ctx, subctx);
+        vk_buffer src_buf = ((ggml_backend_vk_buffer_context *)mb->buffer->context)->dev_buffer;
+        vk_buffer dst_buf = ((ggml_backend_vk_buffer_context *)beta->buffer->context)->dev_buffer;
+        ggml_vk_buffer_copy_async(subctx, dst_buf, vk_tensor_offset(beta) + beta->view_offs, src_buf, vk_tensor_offset(mb) + mb->view_offs, (size_t)R * M * sizeof(float));
+        // a later node that writes this (dead) memory must wait for the copy
+        ctx->unsynced_nodes_read.push_back(mb);
+    }
 }
 
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -18148,6 +18167,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_fwht_norm = false;
         ctx->fused_dn_gates = false;
         ctx->fused_fwht_gnorm = false;
+        ctx->fused_last_after_barrier = false;
         ctx->fused_gdn_set_rows = false;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
@@ -18164,6 +18184,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             } else if (ggml_vk_can_fuse_dn_gates(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = GGML_VK_DN_GATES_NODES - 1;
                 ctx->fused_dn_gates = true;
+                ctx->fused_last_after_barrier = true;
                 ctx->fused_ops_write_mask |= 1 << 4; // the gate MUL is written too
                 fusion_string = "DN_GATES";
                 std::fill_n(op_srcs_fused_elementwise, GGML_VK_DN_GATES_NODES, false);
@@ -18363,7 +18384,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             if (!is_topk_moe_single_row && !ctx->fused_gdn_set_rows) {
                 for (int j = 0; j < 2; ++j) {
                     ggml_tensor *dst = output_nodes[j];
-                    if (!dst) {
+                    if (!dst || (j == 0 && ctx->fused_last_after_barrier)) {
                         continue;
                     }
                     // Loop over all srcs of all nodes in the fusion. If the src overlaps
@@ -18401,6 +18422,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_fwht_norm          = false;
                 ctx->fused_dn_gates           = false;
                 ctx->fused_fwht_gnorm         = false;
+                ctx->fused_last_after_barrier = false;
                 ctx->fused_gdn_set_rows       = false;
             }
         }
