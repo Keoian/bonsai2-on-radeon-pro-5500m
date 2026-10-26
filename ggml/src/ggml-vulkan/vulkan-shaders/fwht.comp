@@ -8,6 +8,11 @@
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_shuffle : enable
 #endif
+#ifdef FWHT_Q8
+// also writes the result as block_q8_1_x4, the same bytes as quantize_q8_1.comp, for the mat-vec that reads it
+#extension GL_KHR_shader_subgroup_clustered : require
+#include "types.glsl"
+#endif
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 32;
 layout(constant_id = 1) const uint N = 128;
@@ -39,6 +44,13 @@ layout(binding = 0, std430) readonly buffer A {
 layout(binding = 1, std430) writeonly buffer D { float data_d[]; };
 #ifdef FWHT_SIGNED
 layout(binding = 2, std430) readonly buffer S { float data_s[]; };
+#endif
+#ifdef FWHT_Q8
+#ifdef FWHT_SIGNED
+layout(binding = 3, std430) writeonly buffer Q { block_q8_1_x4 data_q[]; };
+#else
+layout(binding = 2, std430) writeonly buffer Q { block_q8_1_x4 data_q[]; };
+#endif
 #endif
 
 const uint EL_W = N / BLOCK_SIZE;
@@ -150,6 +162,26 @@ void main() {
             for (uint i = 0; i < EL_W; ++i) {
                 data_d[dst_offset + row_offset + i * BLOCK_SIZE + tid] = reg[i];
             }
+#ifdef FWHT_Q8
+            // a q8_1 block is 32 consecutive elements, so 32 consecutive invocations of one subgroup (SG_SIZE >= 32)
+            [[unroll]]
+            for (uint i = 0; i < EL_W; ++i) {
+                const uint e = row_offset + i * BLOCK_SIZE + tid;
+                const float amax = subgroupClusteredMax(abs(reg[i]), 32);
+                const float d = amax / 127.0;
+                const float d_inv = d != 0.0 ? 1.0 / d : 0.0;
+                const float q = round(reg[i] * d_inv);
+                const float sum = subgroupClusteredAdd(q, 32);
+                const uint packed = subgroupClusteredOr((uint(int(q)) & 0xFFu) << (8u * (tid % 4u)), 4);
+                const uint ib = e / 32u;
+                if (tid % 4u == 0u) {
+                    data_q[ib / 4u].qs[(ib % 4u) * 8u + (e % 32u) / 4u] = int32_t(packed);
+                }
+                if (tid % 32u == 0u) {
+                    data_q[ib / 4u].ds[ib % 4u] = f16vec2(vec2(d, sum * d));
+                }
+            }
+#endif
 #ifdef FWHT_SHMEM
         }
         barrier();

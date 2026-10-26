@@ -1065,6 +1065,9 @@ struct vk_device_struct {
     // one row per workgroup over several subgroups, for transforms of a few rows (decode)
     vk_pipeline pipeline_fwht_wide_f32[GGML_VK_FWHT_NUM_SIZES];
     vk_pipeline pipeline_fwht_wide_signed_f32[GGML_VK_FWHT_NUM_SIZES];
+    // the wide transforms that also write their result as q8_1 for the next mat-vec
+    vk_pipeline pipeline_fwht_wide_q8_f32[GGML_VK_FWHT_NUM_SIZES];
+    vk_pipeline pipeline_fwht_wide_signed_q8_f32[GGML_VK_FWHT_NUM_SIZES];
     vk_pipeline pipeline_cumsum_f32;
     vk_pipeline pipeline_cumsum_small_f32;
     vk_pipeline pipeline_cumsum_multipass1_f32;
@@ -1132,6 +1135,7 @@ struct vk_device_struct {
     bool disable_graph_optimize;
     bool disable_fa_vec;
     bool disable_ptq1_0_w32;
+    bool disable_fwht_q8;
     bool keep_fwht_signed;
 
     std::unique_ptr<vk_memory_logger> memory_logger;
@@ -5925,6 +5929,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 if (device->subgroup_require_full_support && device->subgroup_size_control && block > sg && block % sg == 0) {
                     ggml_vk_create_pipeline(device, device->pipeline_fwht_wide_f32[idx], "fwht_wide_f32", fwht_wide_f32_len, fwht_wide_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block, n, 1, sg }, 1, true, true, sg);
                     ggml_vk_create_pipeline(device, device->pipeline_fwht_wide_signed_f32[idx], "fwht_wide_signed_f32", fwht_wide_signed_f32_len, fwht_wide_signed_f32_data, "main", 3, sizeof(vk_op_fwht_signed_push_constants), {1, 1, 1}, { block, n, 1, sg }, 1, true, true, sg);
+                    // a q8_1 block is 32 invocations of one subgroup
+                    if (!device->disable_fwht_q8 && device->subgroup_clustered && sg >= 32) {
+                        ggml_vk_create_pipeline(device, device->pipeline_fwht_wide_q8_f32[idx], "fwht_wide_q8_f32", fwht_wide_q8_f32_len, fwht_wide_q8_f32_data, "main", 3, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block, n, 1, sg }, 1, true, true, sg);
+                        ggml_vk_create_pipeline(device, device->pipeline_fwht_wide_signed_q8_f32[idx], "fwht_wide_signed_q8_f32", fwht_wide_signed_q8_f32_len, fwht_wide_signed_q8_f32_data, "main", 4, sizeof(vk_op_fwht_signed_push_constants), {1, 1, 1}, { block, n, 1, sg }, 1, true, true, sg);
+                    }
                 }
             } else {
                 // wide blocks trade rows per workgroup for a smaller register block
@@ -6392,6 +6401,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         device->disable_fa_vec = getenv("GGML_VK_DISABLE_FA_VEC") != nullptr;
         device->disable_ptq1_0_w32 = getenv("GGML_VK_DISABLE_PTQ1_0_W32") != nullptr;
+        device->disable_fwht_q8 = getenv("GGML_VK_DISABLE_FWHT_Q8") != nullptr;
         device->keep_fwht_signed = getenv("GGML_VK_DISABLE_KEEP_FWHT_SIGNED") == nullptr;
 
         bool fp16_storage = false;
@@ -10222,22 +10232,67 @@ static bool ggml_vk_can_use_fwht(const ggml_backend_vk_context * ctx, const ggml
     return true;
 }
 
-static void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src, ggml_tensor * dst) {
+// The src1 of the first later mat-mul that reads the transform result mm (index mm_idx) with a quantized src0, so through q8_1.
+// The transform can write that q8_1 copy into prealloc_y itself, and the mat-mul finds it there (prealloc_y_last_tensor_used) and skips its quantize pass.
+static const ggml_tensor * ggml_vk_fwht_q8_consumer(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int mm_idx) {
+    const ggml_tensor * mm = cgraph->nodes[mm_idx];
+    if (!ctx->device->integer_dot_product || mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm) || mm->view_src != nullptr || ggml_nelements(mm) % 128 != 0) {
+        return nullptr;
+    }
+    for (int j = mm_idx + 1; j < cgraph->n_nodes && j <= mm_idx + 16; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (node->op != GGML_OP_MUL_MAT || (node->src[1] != mm && node->src[1]->view_src != mm)) {
+            continue;
+        }
+        const ggml_tensor * src1 = node->src[1];
+        if (!ggml_is_quantized(node->src[0]->type) || src1->view_offs != 0 || !ggml_is_contiguous(src1) || ggml_nelements(src1) != ggml_nelements(mm)) {
+            return nullptr;
+        }
+        return src1;
+    }
+    return nullptr;
+}
+
+// Before a transform writes q8_1 into prealloc_y: make it large enough and wait for the last reader of its old contents.
+static vk_subbuffer ggml_vk_fwht_q8_begin(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * mm) {
+    const uint64_t q8_sz = (uint64_t)ggml_nelements(mm) / 128 * ggml_type_size(GGML_TYPE_Q8_1) * 4;
+    if (ctx->prealloc_size_y < q8_sz) {
+        ctx->prealloc_size_y = q8_sz;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    if (ctx->prealloc_y_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+    return { ctx->prealloc_y, 0, ctx->prealloc_y->size };
+}
+
+// After it: prealloc_y holds what quantize_q8_1 would write for src1.
+static void ggml_vk_fwht_q8_end(ggml_backend_vk_context * ctx, const ggml_tensor * src1) {
+    ctx->prealloc_y_last_pipeline_used = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1).get();
+    ctx->prealloc_y_last_tensor_used = src1;
+    ctx->prealloc_y_last_decode_vector_staging = false;
+    ctx->prealloc_y_need_sync = true;
+}
+
+static void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx, const ggml_tensor * src, ggml_tensor * dst) {
     const int idx = ggml_vk_fwht_pipeline_idx(src->ne[0]);
     vk_pipeline pipeline = src->type == GGML_TYPE_F16 ? ctx->device->pipeline_fwht_f16[idx] : ctx->device->pipeline_fwht_f32[idx];
 
     uint32_t rows_per_workgroup = ctx->device->fwht_rows_per_wg[idx];
     GGML_ASSERT(rows_per_workgroup > 0);
     const uint32_t n_rows = (uint32_t)ggml_nrows(src);
+    const ggml_tensor * q8_src1 = nullptr;
     if (src->type == GGML_TYPE_F32 && ggml_vk_fwht_use_wide(ctx->device->pipeline_fwht_wide_f32[idx], n_rows)) {
         pipeline = ctx->device->pipeline_fwht_wide_f32[idx];
         rows_per_workgroup = 1;
+        if (ctx->device->pipeline_fwht_wide_q8_f32[idx] != nullptr) {
+            q8_src1 = ggml_vk_fwht_q8_consumer(ctx, cgraph, node_idx);
+        }
     }
     const uint32_t max_workgroups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
 
     const uint32_t total_workgroups = CEIL_DIV(n_rows, rows_per_workgroup);
     const uint32_t workgroups_x = std::min(total_workgroups, max_workgroups_x);
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     const vk_subbuffer src_buf = ggml_vk_tensor_subbuffer(ctx, src, true);
     const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
@@ -10250,6 +10305,15 @@ static void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     };
     init_pushconst_tensor_offsets(ctx, pc, src, nullptr, nullptr, nullptr, dst);
 
+    if (q8_src1 != nullptr) {
+        pipeline = ctx->device->pipeline_fwht_wide_q8_f32[idx];
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        const vk_subbuffer q8_buf = ggml_vk_fwht_q8_begin(ctx, subctx, dst);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf, q8_buf }, pc, { workgroups_x, 1, 1 });
+        ggml_vk_fwht_q8_end(ctx, q8_src1);
+        return;
+    }
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf }, pc, { workgroups_x, 1, 1 });
 }
 
@@ -10300,9 +10364,16 @@ static void ggml_vk_fwht_signed(ggml_backend_vk_context * ctx, vk_context& subct
     uint32_t rows_per_workgroup = ctx->device->fwht_rows_per_wg[idx];
     GGML_ASSERT(rows_per_workgroup > 0);
     const uint32_t n_rows = (uint32_t)(ggml_nelements(x) / n);
+    const ggml_tensor * q8_src1 = nullptr;
     if (ggml_vk_fwht_use_wide(ctx->device->pipeline_fwht_wide_signed_f32[idx], n_rows)) {
         pipeline = ctx->device->pipeline_fwht_wide_signed_f32[idx];
         rows_per_workgroup = 1;
+        if (ctx->device->pipeline_fwht_wide_signed_q8_f32[idx] != nullptr) {
+            q8_src1 = ggml_vk_fwht_q8_consumer(ctx, cgraph, node_idx + 2);
+        }
+    }
+    if (q8_src1 != nullptr) {
+        pipeline = ctx->device->pipeline_fwht_wide_signed_q8_f32[idx];
     }
     const uint32_t max_workgroups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
     const uint32_t workgroups_x = std::min(CEIL_DIV(n_rows, rows_per_workgroup), max_workgroups_x);
@@ -10321,7 +10392,13 @@ static void ggml_vk_fwht_signed(ggml_backend_vk_context * ctx, vk_context& subct
         1.0f / std::sqrt((float)n),
     };
 
-    // descriptor bindings must follow the shader: 0 = x, 1 = dst, 2 = signs
+    // descriptor bindings must follow the shader: 0 = x, 1 = dst, 2 = signs, 3 = q8_1 copy
+    if (q8_src1 != nullptr) {
+        const vk_subbuffer q8_buf = ggml_vk_fwht_q8_begin(ctx, subctx, mm);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, d_buf, s_buf, q8_buf }, pc, { workgroups_x, 1, 1 });
+        ggml_vk_fwht_q8_end(ctx, q8_src1);
+        return;
+    }
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, d_buf, s_buf }, pc, { workgroups_x, 1, 1 });
 }
 
@@ -10359,7 +10436,7 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
             m_offset += cur_M_size;
         }
     } else if (ggml_vk_can_use_fwht(ctx, src1, dst)) {
-        ggml_vk_fwht(ctx, subctx, src1, dst);
+        ggml_vk_fwht(ctx, subctx, cgraph, node_idx, src1, dst);
     } else if (src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && dst->ne[1] == 1 &&
         // detect 0213 permutation, and batch size of 1
         src0->nb[0] <= src0->nb[2] &&
