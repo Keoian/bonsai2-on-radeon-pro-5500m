@@ -99,7 +99,7 @@ shared float norm_sh[BLOCK_SIZE];
 // FWHT_GNORM (with FWHT_SIGNED and FWHT_WIDE): the gated norm of a delta net layer and its head regroup.
 // The input data_a holds gn_nk * gn_rep heads of gn_hd per token; head h is rms_norm(data_a head h) * data_w, gated by silu(data_z) (swiglu(z, normed)).
 // The row is these heads regrouped from tiled [hd, nk, rep] to grouped [hd, rep, nk] order: output o = d + hd * (r + rep * k) reads head k + nk * r.
-// The workgroup's N / hd heads (one per 32 invocations) are normed first.
+// The row's N / hd heads (one per 32 invocations) are normed first.
 #ifdef FWHT_Q8
 layout(binding = 4, std430) readonly buffer W { float data_w[]; };
 layout(binding = 5, std430) readonly buffer Z { float data_z[]; };
@@ -107,7 +107,7 @@ layout(binding = 5, std430) readonly buffer Z { float data_z[]; };
 layout(binding = 3, std430) readonly buffer W { float data_w[]; };
 layout(binding = 4, std430) readonly buffer Z { float data_z[]; };
 #endif
-shared float head_scale[BLOCK_SIZE / 32];
+shared float head_scale[N / 32];
 #endif
 
 const uint EL_W = N / BLOCK_SIZE;
@@ -180,9 +180,9 @@ void main() {
         const uint gn_tok   = gn_hd * gn_nk * gn_rep;
         const uint tok_base = (row_offset / gn_tok) * gn_tok;
         const uint j0       = (row_offset - tok_base) / gn_hd;
-        {
-            // invocations 32g .. 32g + 31 norm output head j0 + g
-            const uint j = j0 + tid / 32u;
+        // invocations 32g .. 32g + 31 norm output head j0 + g, for the N / gn_hd heads of the row
+        for (uint g = tid / 32u; g < N / gn_hd; g += BLOCK_SIZE / 32u) {
+            const uint j = j0 + g;
             const uint h = j / gn_rep + gn_nk * (j % gn_rep);
             float ss = 0.0;
             for (uint c = tid % 32u; c < gn_hd; c += 32u) {
@@ -191,10 +191,10 @@ void main() {
             }
             ss = subgroupClusteredAdd(ss, 32);
             if (tid % 32u == 0u) {
-                head_scale[tid / 32u] = inversesqrt(ss / float(gn_hd) + gn_eps);
+                head_scale[g] = inversesqrt(ss / float(gn_hd) + gn_eps);
             }
-            barrier();
         }
+        barrier();
 #endif
 
         [[unroll]]

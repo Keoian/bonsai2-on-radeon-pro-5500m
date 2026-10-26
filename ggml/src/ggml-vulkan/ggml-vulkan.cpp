@@ -781,6 +781,8 @@ static constexpr uint32_t GGML_VK_FWHT_ROWS              = 4;
 // up to this many rows (a decode step's few vectors) one row takes a workgroup of GGML_VK_FWHT_WIDE_BLOCK
 // invocations; under one subgroup per row they left most CUs idle (5 rows of 1024: 27 -> 7 us)
 static constexpr uint32_t GGML_VK_FWHT_WIDE_BLOCK        = 256;
+// rows of 1024 or more take GGML_VK_FWHT_WIDE_BLOCK_LARGE: decode on RDNA1 is 1.3% faster with 512 than with 256 or 1024
+static constexpr uint32_t GGML_VK_FWHT_WIDE_BLOCK_LARGE  = 512;
 static constexpr uint32_t GGML_VK_FWHT_WIDE_MAX_ROWS     = 256;
 
 struct vk_device_struct {
@@ -5988,7 +5990,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     ggml_vk_create_pipeline(device, device->pipeline_fwht_signed_f32[idx], "fwht_signed_f32", fwht_signed_f32_len, fwht_signed_f32_data, "main", 3, sizeof(vk_op_fwht_signed_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
                     device->fwht_rows_per_wg[idx] = GGML_VK_FWHT_ROWS;
                 }
-                const uint32_t block = std::min(n, GGML_VK_FWHT_WIDE_BLOCK);
+                const uint32_t block = std::min(n, n >= 1024 ? GGML_VK_FWHT_WIDE_BLOCK_LARGE : GGML_VK_FWHT_WIDE_BLOCK);
                 if (device->subgroup_require_full_support && device->subgroup_size_control && block > sg && block % sg == 0) {
                     ggml_vk_create_pipeline(device, device->pipeline_fwht_wide_f32[idx], "fwht_wide_f32", fwht_wide_f32_len, fwht_wide_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block, n, 1, sg }, 1, true, true, sg);
                     ggml_vk_create_pipeline(device, device->pipeline_fwht_wide_signed_f32[idx], "fwht_wide_signed_f32", fwht_wide_signed_f32_len, fwht_wide_signed_f32_data, "main", 3, sizeof(vk_op_fwht_signed_push_constants), {1, 1, 1}, { block, n, 1, sg }, 1, true, true, sg);
@@ -10684,10 +10686,9 @@ static bool ggml_vk_can_fuse_fwht_gnorm(const ggml_backend_vk_context * ctx, con
         n[5]->ne[1] != rep || n[5]->ne[2] != nk || n[5]->nb[1] != n[4]->nb[2] || n[5]->nb[2] != n[4]->nb[1] || !ggml_is_contiguous(n[6])) {
         return false;
     }
-    // the workgroup norms its N / hd heads with 32 invocations each
+    // the workgroup norms the row's N / hd heads with 32 invocations each
     const int idx = ggml_vk_fwht_pipeline_idx(N);
-    const int64_t block = std::min<int64_t>(N, GGML_VK_FWHT_WIDE_BLOCK);
-    if (idx < 0 || N % hd != 0 || (hd * nk * rep) % N != 0 || N / hd != block / 32 || ctx->device->pipeline_fwht_wide_signed_gnorm_f32[idx] == nullptr) {
+    if (idx < 0 || N % hd != 0 || (hd * nk * rep) % N != 0 || hd < 32 || ctx->device->pipeline_fwht_wide_signed_gnorm_f32[idx] == nullptr) {
         return false;
     }
     const ggml_tensor * signs = mul->src[0] == n[7] ? mul->src[1] : mul->src[0];
