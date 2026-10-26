@@ -49,6 +49,15 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
 void common_speculative_free(common_speculative * spec);
 
+// one decoded MTP draft step. The step that stopped drafting is included; its token was not added
+struct common_speculative_trace_step {
+    llama_token  id;       // the drafted token (the top-1 on the stop step)
+    float        q;        // the draft's probability of id: the sampled q, else the top-1 p
+    float        p1;       // top-1 p of the step's candidates (T 1)
+    float        H;        // entropy (nats) of the step's candidates
+    const char * stop;     // "p_min", "iso", "n_max" or nullptr
+};
+
 struct common_speculative_draft_params {
     // this flag is used to chain the drafts through all the available implementations
     // after the first successful draft from an implementation, we set it
@@ -84,7 +93,21 @@ struct common_speculative_draft_params {
     llama_tokens pen_window        = {}; // the target's penalty window up to and including id_last, oldest first
 
     std::vector<std::vector<llama_token_data>> dists = {};
+
+    // when set, the MTP draft clears it and appends one entry per decoded step (--spec-trace)
+    std::vector<common_speculative_trace_step> * trace = nullptr;
 };
+
+// the stop rule tables: piecewise-linear iso_q / iso_p1 over the points x, and theta
+struct common_spec_stop_iso {
+    float              theta = 0.0f;
+    std::vector<float> x, q, p1;
+
+    float lookup(const std::vector<float> & tab, float v) const;
+};
+
+// the built-in tables (P100 fork, Qwen3.8-27B, thinking-off; placeholders), or path's, theta overriding when > 0. Throws on a bad file
+common_spec_stop_iso common_spec_stop_iso_load(const std::string & path, float theta);
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 
