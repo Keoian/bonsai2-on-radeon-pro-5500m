@@ -1132,6 +1132,7 @@ struct vk_device_struct {
     bool disable_graph_optimize;
     bool disable_fa_vec;
     bool disable_ptq1_0_w32;
+    bool keep_fwht_signed;
 
     std::unique_ptr<vk_memory_logger> memory_logger;
 
@@ -6391,6 +6392,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         device->disable_fa_vec = getenv("GGML_VK_DISABLE_FA_VEC") != nullptr;
         device->disable_ptq1_0_w32 = getenv("GGML_VK_DISABLE_PTQ1_0_W32") != nullptr;
+        device->keep_fwht_signed = getenv("GGML_VK_DISABLE_KEEP_FWHT_SIGNED") == nullptr;
 
         bool fp16_storage = false;
         bool fp16_compute = false;
@@ -17984,6 +17986,14 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
             return false;
         };
 
+        // MUL(signs) -> RESHAPE -> MUL_MAT(hadamard) is one dispatch (ggml_vk_can_fuse_fwht_signed) only if the three nodes stay adjacent
+        auto const &is_fwht_signed_at = [&](int start) -> bool {
+            return match_pattern({ GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, start) &&
+                graph->nodes[start + 1]->src[0] == graph->nodes[start] &&
+                graph->nodes[start + 2]->src[1] == graph->nodes[start + 1] &&
+                ggml_get_op_params_i32(graph->nodes[start + 2], 1) == GGML_HINT_SRC0_IS_HADAMARD;
+        };
+
         auto const &keep_pattern = [&](const std::initializer_list<ggml_op> &pattern) -> bool {
             if (match_pattern(pattern, first_unused)) {
                 for (size_t j = 0; j < pattern.size(); ++j) {
@@ -18017,6 +18027,9 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         if (keep_pattern(snake_pattern)) {
             continue;
         }
+        if (ctx->device->keep_fwht_signed && is_fwht_signed_at(first_unused) && keep_pattern({ GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT })) {
+            continue;
+        }
 
         // First, grab the next unused node.
         current_set.push_back(first_unused);
@@ -18041,7 +18054,8 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 match_pattern(topk_moe_sqrt_softplus_norm_bias, j) ||
                 match_pattern(topk_moe_early_softmax, j) ||
                 match_pattern(topk_moe_late_softmax, j) ||
-                match_pattern(snake_pattern, j)) {
+                match_pattern(snake_pattern, j) ||
+                (ctx->device->keep_fwht_signed && is_fwht_signed_at(j))) {
                 continue;
             }
             bool ok = true;
