@@ -1055,6 +1055,8 @@ void process_shaders() {
     string_to_spv("fwht_wide_signed_norm_f32", "fwht.comp", {{"FWHT_SHMEM", "1"}, {"FWHT_WIDE", "1"}, {"FWHT_SIGNED", "1"}, {"FWHT_NORM", "1"}});
     string_to_spv("fwht_wide_signed_norm_q8_f32", "fwht.comp", {{"FWHT_SHMEM", "1"}, {"FWHT_WIDE", "1"}, {"FWHT_SIGNED", "1"}, {"FWHT_NORM", "1"}, {"FWHT_Q8", "1"}});
     string_to_spv("dn_gates_f32", "dn_gates.comp", {});
+    string_to_spv("fwht_wide_signed_gnorm_f32", "fwht.comp", {{"FWHT_SHMEM", "1"}, {"FWHT_WIDE", "1"}, {"FWHT_SIGNED", "1"}, {"FWHT_GNORM", "1"}});
+    string_to_spv("fwht_wide_signed_gnorm_q8_f32", "fwht.comp", {{"FWHT_SHMEM", "1"}, {"FWHT_WIDE", "1"}, {"FWHT_SIGNED", "1"}, {"FWHT_GNORM", "1"}, {"FWHT_Q8", "1"}});
     string_to_spv("fwht_f16", "fwht.comp", {{"FWHT_F16", "1"}});
     string_to_spv("fwht_shmem_f16", "fwht.comp", {{"FWHT_F16", "1"}, {"FWHT_SHMEM", "1"}});
     string_to_spv("count_equal_i32", "count_equal.comp", merge_maps(base_dict, {{"A_TYPE", "int"}, {"B_TYPE", "int"}, {"D_TYPE", "int"}}));

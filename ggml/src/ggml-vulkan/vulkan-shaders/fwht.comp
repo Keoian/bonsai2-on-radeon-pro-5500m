@@ -13,8 +13,11 @@
 #extension GL_KHR_shader_subgroup_clustered : require
 #include "types.glsl"
 #endif
-#ifdef FWHT_NORM
+#if defined(FWHT_NORM) || defined(FWHT_GNORM)
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
+#ifdef FWHT_GNORM
+#extension GL_KHR_shader_subgroup_clustered : require
 #endif
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 32;
@@ -43,6 +46,14 @@ layout(push_constant) uniform parameter
     float norm_eps;
     uint w_offset;
     uint normed_offset;
+#endif
+#ifdef FWHT_GNORM
+    uint gn_hd;         // head size (norm row)
+    uint gn_nk;         // heads per tile
+    uint gn_rep;        // tiles
+    float gn_eps;
+    uint gn_w_offset;
+    uint gn_z_offset;
 #endif
 };
 
@@ -83,6 +94,20 @@ layout(binding = 3, std430) readonly buffer W { float data_w[]; };
 layout(binding = 4, std430) writeonly buffer NO { float data_normed[]; };
 #endif
 shared float norm_sh[BLOCK_SIZE];
+#endif
+#ifdef FWHT_GNORM
+// FWHT_GNORM (with FWHT_SIGNED and FWHT_WIDE): the gated norm of a delta net layer and its head regroup.
+// The input data_a holds gn_nk * gn_rep heads of gn_hd per token; head h is rms_norm(data_a head h) * data_w, gated by silu(data_z) (swiglu(z, normed)).
+// The row is these heads regrouped from tiled [hd, nk, rep] to grouped [hd, rep, nk] order: output o = d + hd * (r + rep * k) reads head k + nk * r.
+// The workgroup's N / hd heads (one per 32 invocations) are normed first.
+#ifdef FWHT_Q8
+layout(binding = 4, std430) readonly buffer W { float data_w[]; };
+layout(binding = 5, std430) readonly buffer Z { float data_z[]; };
+#else
+layout(binding = 3, std430) readonly buffer W { float data_w[]; };
+layout(binding = 4, std430) readonly buffer Z { float data_z[]; };
+#endif
+shared float head_scale[BLOCK_SIZE / 32];
 #endif
 
 const uint EL_W = N / BLOCK_SIZE;
@@ -151,9 +176,41 @@ void main() {
         const float norm_scale = inversesqrt(ss / float(norm_ne) + norm_eps);
 #endif
 
+#ifdef FWHT_GNORM
+        const uint gn_tok   = gn_hd * gn_nk * gn_rep;
+        const uint tok_base = (row_offset / gn_tok) * gn_tok;
+        const uint j0       = (row_offset - tok_base) / gn_hd;
+        {
+            // invocations 32g .. 32g + 31 norm output head j0 + g
+            const uint j = j0 + tid / 32u;
+            const uint h = j / gn_rep + gn_nk * (j % gn_rep);
+            float ss = 0.0;
+            for (uint c = tid % 32u; c < gn_hd; c += 32u) {
+                const float v = float(data_a[src_offset + tok_base + h * gn_hd + c]);
+                ss += v * v;
+            }
+            ss = subgroupClusteredAdd(ss, 32);
+            if (tid % 32u == 0u) {
+                head_scale[tid / 32u] = inversesqrt(ss / float(gn_hd) + gn_eps);
+            }
+            barrier();
+        }
+#endif
+
         [[unroll]]
         for (uint i = 0; i < EL_W; ++i) {
-#if defined(FWHT_NORM)
+#if defined(FWHT_GNORM)
+            {
+                const uint o = row_offset - tok_base + i * BLOCK_SIZE + tid;
+                const uint d = o % gn_hd;
+                const uint j = o / gn_hd;
+                const uint s_idx = tok_base + (j / gn_rep + gn_nk * (j % gn_rep)) * gn_hd + d;
+                // rms_norm_mul (scale * x * w), then swiglu(z, normed) = silu(z) * normed, then the sign
+                const float x = head_scale[j - j0] * float(data_a[src_offset + s_idx]) * data_w[gn_w_offset + d];
+                const float z = data_z[gn_z_offset + s_idx];
+                reg[i] = (z / (1.0f + exp(-z)) * x) * data_s[signs_offset + (row_offset % signs_ne) + i * BLOCK_SIZE + tid] * scale;
+            }
+#elif defined(FWHT_NORM)
             {
                 const uint e = row_offset + i * BLOCK_SIZE + tid;
                 const float x = norm_scale * float(data_a[src_offset + e]) * data_w[w_offset + (e - norm_base)];
