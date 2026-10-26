@@ -1,0 +1,95 @@
+#version 450
+
+// The gates of a gated delta net layer in one dispatch (bf16 weights):
+//   gate = softplus(w_alpha * x + dt_bias) * ssm_a,  beta = sigmoid(w_beta * x)
+// One workgroup per output: workgroup x in 0 .. R-1 is an alpha row, R .. 2R-1 a beta row; workgroup y is the column.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint K;             // row length, even
+    uint R;             // rows of each weight
+    uint x_offset;      // floats
+    uint x_stride;      // floats between columns
+    uint wa_offset;     // bf16 pairs
+    uint wb_offset;     // bf16 pairs
+    uint bias_offset;
+    uint a_offset;
+    uint gate_offset;
+    uint gate_stride;
+    uint beta_offset;
+    uint beta_stride;
+} p;
+
+layout(binding = 0) readonly buffer X {float data_x[];};
+layout(binding = 1) readonly buffer WA {uint data_wa[];};
+layout(binding = 2) readonly buffer WB {uint data_wb[];};
+layout(binding = 3) readonly buffer BI {float data_bias[];};
+layout(binding = 4) readonly buffer SA {float data_sa[];};
+layout(binding = 5) writeonly buffer G {float data_gate[];};
+layout(binding = 6) writeonly buffer BE {float data_beta[];};
+
+const uint UNROLL = 8;
+
+shared float sums[64];
+
+void main() {
+    const uint row  = gl_WorkGroupID.x;
+    const uint col  = gl_WorkGroupID.y;
+    const bool beta = row >= p.R;
+    const uint r    = beta ? row - p.R : row;
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint nt   = gl_WorkGroupSize.x;
+
+    const uint npairs = p.K / 2;
+    const uint wbase  = (beta ? p.wb_offset : p.wa_offset) + r * npairs;
+    const uint xbase  = p.x_offset + col * p.x_stride;
+
+    // UNROLL loads in flight per invocation
+    float acc[UNROLL];
+    [[unroll]] for (uint k = 0; k < UNROLL; ++k) {
+        acc[k] = 0.0;
+    }
+    uint i = tid;
+    for (; i + (UNROLL - 1) * nt < npairs; i += UNROLL * nt) {
+        [[unroll]] for (uint k = 0; k < UNROLL; ++k) {
+            const uint ip = i + k * nt;
+            const uint w = beta ? data_wb[wbase + ip] : data_wa[wbase + ip];
+            acc[k] = fma(uintBitsToFloat(w << 16), data_x[xbase + 2 * ip], acc[k]);
+            acc[k] = fma(uintBitsToFloat(w & 0xFFFF0000u), data_x[xbase + 2 * ip + 1], acc[k]);
+        }
+    }
+    for (; i < npairs; i += nt) {
+        const uint w = beta ? data_wb[wbase + i] : data_wa[wbase + i];
+        acc[0] = fma(uintBitsToFloat(w << 16), data_x[xbase + 2 * i], acc[0]);
+        acc[0] = fma(uintBitsToFloat(w & 0xFFFF0000u), data_x[xbase + 2 * i + 1], acc[0]);
+    }
+    float sum = 0.0;
+    [[unroll]] for (uint k = 0; k < UNROLL; ++k) {
+        sum += acc[k];
+    }
+    sum = subgroupAdd(sum);
+    if (gl_SubgroupInvocationID == 0) {
+        sums[gl_SubgroupID] = sum;
+    }
+    barrier();
+
+    if (tid == 0) {
+        sum = 0.0;
+        for (uint sg = 0; sg < gl_NumSubgroups; ++sg) {
+            sum += sums[sg];
+        }
+        // the formulas of op_softplus and op_sigmoid in unary.comp
+        if (beta) {
+            data_beta[p.beta_offset + col * p.beta_stride + r] = 1.0f / (1.0f + exp(-sum));
+        } else {
+            const float v = sum + data_bias[p.bias_offset + r];
+            const float sp = (v > 20.0f) ? v : log(1.0f + exp(v));
+            data_gate[p.gate_offset + col * p.gate_stride + r] = sp * data_sa[p.a_offset + r];
+        }
+    }
+}

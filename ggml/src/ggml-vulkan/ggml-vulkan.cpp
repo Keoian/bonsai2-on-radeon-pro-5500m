@@ -1074,6 +1074,8 @@ struct vk_device_struct {
     // the signed wide transforms that load rms_norm(x) * w instead of a row
     vk_pipeline pipeline_fwht_wide_signed_norm_f32[GGML_VK_FWHT_NUM_SIZES];
     vk_pipeline pipeline_fwht_wide_signed_norm_q8_f32[GGML_VK_FWHT_NUM_SIZES];
+    // the gates of a gated delta net layer (two bf16 mat-vecs and their elementwise tails) in one dispatch
+    vk_pipeline pipeline_dn_gates_f32;
     vk_pipeline pipeline_cumsum_f32;
     vk_pipeline pipeline_cumsum_small_f32;
     vk_pipeline pipeline_cumsum_multipass1_f32;
@@ -1144,6 +1146,7 @@ struct vk_device_struct {
     bool disable_fwht_q8;
     bool disable_fwht_glu;
     bool disable_fwht_norm;
+    bool disable_dn_gates;
     bool keep_fwht_signed;
 
     std::unique_ptr<vk_memory_logger> memory_logger;
@@ -1449,6 +1452,21 @@ struct vk_op_fwht_signed_push_constants {
     uint32_t signs_ne;
     uint32_t dst_offset;
     float scale;
+};
+
+struct vk_op_dn_gates_push_constants {
+    uint32_t K;
+    uint32_t R;
+    uint32_t x_offset;
+    uint32_t x_stride;
+    uint32_t wa_offset;
+    uint32_t wb_offset;
+    uint32_t bias_offset;
+    uint32_t a_offset;
+    uint32_t gate_offset;
+    uint32_t gate_stride;
+    uint32_t beta_offset;
+    uint32_t beta_stride;
 };
 
 struct vk_op_fwht_glu_push_constants {
@@ -2460,6 +2478,8 @@ struct ggml_backend_vk_context {
     bool fused_fwht_glu {};
     // set when the current node leads a RMS_NORM -> MUL -> MUL -> RESHAPE -> MUL_MAT(hadamard) fusion
     bool fused_fwht_norm {};
+    // set when the current node leads the gated delta net gates (ggml_vk_can_fuse_dn_gates)
+    bool fused_dn_gates {};
     bool fused_gdn_set_rows {};
 
     // for GGML_VK_PERF_LOGGER
@@ -5989,6 +6009,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
 
+    if (!device->disable_dn_gates && device->subgroup_arithmetic && device->subgroup_basic) {
+        // 256 invocations per output row: 10.6 us for Bonsai's 2 x 48 rows of 5120, against 21 us with one subgroup of 64
+        ggml_vk_create_pipeline(device, device->pipeline_dn_gates_f32, "dn_gates_f32", dn_gates_f32_len, dn_gates_f32_data, "main", 7, sizeof(vk_op_dn_gates_push_constants), {1, 1, 1}, { 256 }, 1, true, true, device->subgroup_size);
+    }
+
     const uint32_t cumsum_elem_per_thread = (device->vendor_id == VK_VENDOR_ID_AMD || device->vendor_id == VK_VENDOR_ID_INTEL) ? 2 : 4;
     ggml_vk_create_pipeline(device, device->pipeline_cumsum_f32,       "cumsum_f32", cumsum_f32_len, cumsum_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { 256, device->subgroup_size, cumsum_elem_per_thread }, 1, true, true, device->subgroup_size);
     ggml_vk_create_pipeline(device, device->pipeline_cumsum_small_f32, "cumsum_f32", cumsum_f32_len, cumsum_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { 128, device->subgroup_size, 1 }, 1, true, true, device->subgroup_size);
@@ -6441,6 +6466,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->disable_fwht_q8 = getenv("GGML_VK_DISABLE_FWHT_Q8") != nullptr;
         device->disable_fwht_glu = getenv("GGML_VK_DISABLE_FWHT_GLU") != nullptr;
         device->disable_fwht_norm = getenv("GGML_VK_DISABLE_FWHT_NORM") != nullptr;
+        device->disable_dn_gates = getenv("GGML_VK_DISABLE_DN_GATES") != nullptr;
         device->keep_fwht_signed = getenv("GGML_VK_DISABLE_KEEP_FWHT_SIGNED") == nullptr;
 
         bool fp16_storage = false;
@@ -10578,6 +10604,88 @@ static void ggml_vk_fwht_norm(ggml_backend_vk_context * ctx, vk_context& subctx,
     } else {
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, d_buf, s_buf, w_buf, n_buf }, pc, { workgroups_x, 1, 1 });
     }
+}
+
+// The gates of a gated delta net layer, 9 nodes in this order (qwen35 build_layer_attn_linear):
+//   MUL_MAT(w_alpha, x) -> RESHAPE -> ADD(dt_bias) -> SOFTPLUS -> MUL(ssm_a) -> RESHAPE, MUL_MAT(w_beta, x) -> RESHAPE -> SIGMOID
+// bf16 weights, at most 8 columns. One dispatch writes the MUL (gate) and the SIGMOID (beta).
+static constexpr int GGML_VK_DN_GATES_NODES = 9;
+
+static bool ggml_vk_can_fuse_dn_gates(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (ctx->device->pipeline_dn_gates_f32 == nullptr || node_idx + GGML_VK_DN_GATES_NODES > cgraph->n_nodes) {
+        return false;
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_RESHAPE,
+                                                    GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY }, { node_idx + 5, node_idx + 8 })) {
+        return false;
+    }
+    const ggml_tensor * const * n = cgraph->nodes + node_idx;
+    const ggml_tensor * ma = n[0];
+    const ggml_tensor * mb = n[6];
+    if (ggml_get_unary_op(n[3]) != GGML_UNARY_OP_SOFTPLUS || ggml_get_unary_op(n[8]) != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+    // edges
+    if (n[1]->src[0] != ma || n[3]->src[0] != n[2] || n[5]->src[0] != n[4] || n[7]->src[0] != mb || n[8]->src[0] != n[7] ||
+        (n[2]->src[0] != n[1] && n[2]->src[1] != n[1]) || (n[4]->src[0] != n[3] && n[4]->src[1] != n[3])) {
+        return false;
+    }
+    const ggml_tensor * x    = ma->src[1];
+    const ggml_tensor * wa   = ma->src[0];
+    const ggml_tensor * wb   = mb->src[0];
+    const ggml_tensor * bias = n[2]->src[0] == n[1] ? n[2]->src[1] : n[2]->src[0];
+    const ggml_tensor * sa   = n[4]->src[0] == n[3] ? n[4]->src[1] : n[4]->src[0];
+    const int64_t K = wa->ne[0];
+    const int64_t R = wa->ne[1];
+    const int64_t M = x->ne[1];
+    if (mb->src[1] != x || wa->type != GGML_TYPE_BF16 || wb->type != GGML_TYPE_BF16 || !ggml_are_same_shape(wa, wb) ||
+        !ggml_is_contiguous(wa) || !ggml_is_contiguous(wb) || K % 2 != 0 ||
+        x->type != GGML_TYPE_F32 || x->ne[0] != K || M > 8 || x->ne[2] != 1 || x->ne[3] != 1 || x->nb[0] != sizeof(float) ||
+        !ggml_is_contiguous(ma) || !ggml_is_contiguous(mb) || ma->ne[0] != R || mb->ne[0] != R ||
+        bias->type != GGML_TYPE_F32 || sa->type != GGML_TYPE_F32 || ggml_nelements(bias) != R || ggml_nelements(sa) != R ||
+        !ggml_is_contiguous(bias) || !ggml_is_contiguous(sa) ||
+        n[2]->type != GGML_TYPE_F32 || n[3]->type != GGML_TYPE_F32 || n[4]->type != GGML_TYPE_F32 || n[8]->type != GGML_TYPE_F32 ||
+        ggml_nelements(n[2]) != R * M || ggml_nelements(n[4]) != R * M || ggml_nelements(n[8]) != R * M ||
+        !ggml_is_contiguous(n[4]) || !ggml_is_contiguous(n[8])) {
+        return false;
+    }
+    // the weights are read as bf16 pairs
+    return get_misalign_bytes(ctx, wa) % 4 == 0 && get_misalign_bytes(ctx, wb) % 4 == 0;
+}
+
+static void ggml_vk_dn_gates(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * const * n = cgraph->nodes + node_idx;
+    const ggml_tensor * ma   = n[0];
+    const ggml_tensor * mb   = n[6];
+    const ggml_tensor * x    = ma->src[1];
+    const ggml_tensor * wa   = ma->src[0];
+    const ggml_tensor * wb   = mb->src[0];
+    const ggml_tensor * bias = n[2]->src[0] == n[1] ? n[2]->src[1] : n[2]->src[0];
+    const ggml_tensor * sa   = n[4]->src[0] == n[3] ? n[4]->src[1] : n[4]->src[0];
+    const ggml_tensor * gate = n[4];
+    const ggml_tensor * beta = n[8];
+
+    const uint32_t K = (uint32_t)wa->ne[0];
+    const uint32_t R = (uint32_t)wa->ne[1];
+    const uint32_t M = (uint32_t)x->ne[1];
+
+    vk_pipeline pipeline = ctx->device->pipeline_dn_gates_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_op_dn_gates_push_constants pc = {
+        K, R,
+        (uint32_t)(get_misalign_bytes(ctx, x) / sizeof(float)), (uint32_t)(x->nb[1] / sizeof(float)),
+        (uint32_t)(get_misalign_bytes(ctx, wa) / 4), (uint32_t)(get_misalign_bytes(ctx, wb) / 4),
+        (uint32_t)(get_misalign_bytes(ctx, bias) / sizeof(float)), (uint32_t)(get_misalign_bytes(ctx, sa) / sizeof(float)),
+        (uint32_t)(get_misalign_bytes(ctx, gate) / sizeof(float)), R,
+        (uint32_t)(get_misalign_bytes(ctx, beta) / sizeof(float)), R,
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+            ggml_vk_tensor_subbuffer(ctx, x, true), ggml_vk_tensor_subbuffer(ctx, wa, true), ggml_vk_tensor_subbuffer(ctx, wb, true),
+            ggml_vk_tensor_subbuffer(ctx, bias, true), ggml_vk_tensor_subbuffer(ctx, sa, true),
+            ggml_vk_tensor_subbuffer(ctx, gate, true), ggml_vk_tensor_subbuffer(ctx, beta, true),
+        }, pc, { 2 * R, M, 1 });
 }
 
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -16399,6 +16507,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_MUL_MAT:
+        if (ctx->fused_dn_gates) {
+            ggml_vk_dn_gates(ctx, compute_ctx, cgraph, node_idx);
+            break;
+        }
         ggml_vk_mul_mat(ctx, compute_ctx, cgraph, node_idx);
 
         break;
@@ -17881,6 +17993,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_fwht_signed = false;
         ctx->fused_fwht_glu = false;
         ctx->fused_fwht_norm = false;
+        ctx->fused_dn_gates = false;
         ctx->fused_gdn_set_rows = false;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
@@ -17894,6 +18007,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_gdn_set_rows = true;
                 ctx->fused_ops_write_mask |= 1; // the attention scores still go to the op's own output
                 fusion_string = "GATED_DELTA_NET_SET_ROWS";
+            } else if (ggml_vk_can_fuse_dn_gates(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = GGML_VK_DN_GATES_NODES - 1;
+                ctx->fused_dn_gates = true;
+                ctx->fused_ops_write_mask |= 1 << 4; // the gate MUL is written too
+                fusion_string = "DN_GATES";
+                std::fill_n(op_srcs_fused_elementwise, GGML_VK_DN_GATES_NODES, false);
             } else if (ggml_vk_can_fuse_fwht_norm(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 4;
                 ctx->fused_fwht_norm = true;
@@ -18121,6 +18240,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_fwht_signed        = false;
                 ctx->fused_fwht_glu           = false;
                 ctx->fused_fwht_norm          = false;
+                ctx->fused_dn_gates           = false;
                 ctx->fused_gdn_set_rows       = false;
             }
         }
@@ -18280,6 +18400,35 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 ggml_get_op_params_i32(graph->nodes[start + 2], 1) == GGML_HINT_SRC0_IS_HADAMARD;
         };
 
+        // the 9 nodes of the gated delta net gates (ggml_vk_can_fuse_dn_gates)
+        auto const &is_dn_gates_at = [&](int start) -> bool {
+            return match_pattern({ GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY }, start) &&
+                graph->nodes[start]->src[0]->type == GGML_TYPE_BF16 && graph->nodes[start + 6]->src[1] == graph->nodes[start]->src[1] &&
+                ggml_get_unary_op(graph->nodes[start + 3]) == GGML_UNARY_OP_SOFTPLUS && ggml_get_unary_op(graph->nodes[start + 8]) == GGML_UNARY_OP_SIGMOID;
+        };
+        // the nodes after the GATED_DELTA_NET of a fusable GDN + SET_ROWS (0 if none), all unused
+        auto const &gdn_set_rows_at = [&](int start) -> int {
+            if (graph->nodes[start]->op != GGML_OP_GATED_DELTA_NET || ctx->device->disable_fusion) {
+                return 0;
+            }
+            const int n_gdn = ggml_vk_can_fuse_gdn_set_rows(graph, start);
+            for (int k = 0; k <= n_gdn; ++k) {
+                if (used[start + k]) {
+                    return 0;
+                }
+            }
+            return n_gdn;
+        };
+        // the beta mat-vec in the middle does not depend on the alpha nodes, so no node of the pattern may be pulled forward
+        auto const &in_dn_gates = [&](int j) -> bool {
+            for (int k = 0; k < 9 && k <= j; ++k) {
+                if (is_dn_gates_at(j - k)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
         // RMS_NORM -> MUL(w) whose result a later such transform reads is fused into it too (ggml_vk_can_fuse_fwht_norm).
         // Returns the transform's first node, or -1. The transform reads only the MUL(w) result and weights, so it can move up to it.
         auto const &fwht_norm_chain = [&](int start) -> int {
@@ -18341,6 +18490,22 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         if (keep_pattern(snake_pattern)) {
             continue;
         }
+        if (ctx->device->pipeline_dn_gates_f32 != nullptr && is_dn_gates_at(first_unused) &&
+            keep_pattern({ GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY })) {
+            continue;
+        }
+        // GATED_DELTA_NET -> VIEW(s) -> SET_ROWS is one dispatch (ggml_vk_can_fuse_gdn_set_rows) only if the nodes stay adjacent
+        if (const int n_gdn = gdn_set_rows_at(first_unused)) {
+            for (int n = first_unused; n <= first_unused + n_gdn; ++n) {
+                new_order.push_back(graph->nodes[n]);
+                used_node_set.insert(graph->nodes[n]);
+                used[n] = true;
+            }
+            while (first_unused < graph->n_nodes && used[first_unused]) {
+                first_unused++;
+            }
+            continue;
+        }
         if (ctx->device->keep_fwht_signed) {
             const int k = fwht_norm_chain(first_unused);
             if (k >= 0) {
@@ -18386,7 +18551,9 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 match_pattern(topk_moe_early_softmax, j) ||
                 match_pattern(topk_moe_late_softmax, j) ||
                 match_pattern(snake_pattern, j) ||
-                (ctx->device->keep_fwht_signed && (is_fwht_signed_at(j) || is_fwht_glu_at(j) || fwht_norm_chain(j) >= 0))) {
+                (ctx->device->keep_fwht_signed && (is_fwht_signed_at(j) || is_fwht_glu_at(j) || fwht_norm_chain(j) >= 0)) ||
+                (ctx->device->pipeline_dn_gates_f32 != nullptr && in_dn_gates(j)) ||
+                gdn_set_rows_at(j) != 0) {
                 continue;
             }
             bool ok = true;

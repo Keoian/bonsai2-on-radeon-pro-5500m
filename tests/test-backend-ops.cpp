@@ -10143,7 +10143,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // ARC-LAB fusion tests (arctune): Bonsai 27B shapes and token counts, 3 seeds each
     for (int seed = 0; seed < 3; ++seed) {
-        for (int64_t M : {1, 4, 5, 8}) {
+        for (int64_t M : {1, 2, 4, 5, 8}) {
             test_cases.emplace_back(new test_arclab_glu_rot(17408, M, 512, seed));
             test_cases.emplace_back(new test_arclab_add_norm_rot(5120, M, 512, false, seed));
             test_cases.emplace_back(new test_arclab_dn_gates(5120, 48, M, seed));
