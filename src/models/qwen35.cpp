@@ -603,8 +603,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
     cb(cur, "linear_attn_out", il);
 
-    // Reshape back to original dimensions
-    cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
+    // Reshape back to original dimensions. With one sequence the result already has that shape; without the reshape node
+    // a backend can fuse the residual add into the mat-mul (the Vulkan MUL_MAT + ADD fusion needs the two nodes adjacent).
+    if (n_seqs != 1) {
+        cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
+    }
 
     return cur;
 }
