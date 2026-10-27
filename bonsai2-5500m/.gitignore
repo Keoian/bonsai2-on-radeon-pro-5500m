@@ -1,3 +1,5 @@
 # Model files are downloaded separately (see .github/README.md); never commit them.
 models/
 *.gguf
+# saved chats (chat-cache.ps1), large and tied to one model and its settings
+slots/

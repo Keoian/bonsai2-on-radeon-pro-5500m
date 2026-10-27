@@ -17,6 +17,9 @@
 
   Then open http://localhost:8080 in a browser.
 
+  To keep a chat across a server restart: .\chat-cache.ps1 save before stopping, .\chat-cache.ps1 restore after
+  starting again (same model and settings). The files go to -SlotDir, by default .\slots next to this script.
+
   Model files are looked up in: -ModelDir, then $env:BONSAI_MODEL_DIR, then .\models next to this
   script, then a "models" folder beside the repo checkout. The server binary is expected at
   <repo>\build\bin\llama-server.exe (the default CMake build folder).
@@ -43,6 +46,8 @@ param(
     [int]    $Ngl = 99,
     [int]    $Parallel = 1,
     [string] $ModelDir,
+    # where chat-cache.ps1 saves and restores chats (the server's slot save path)
+    [string] $SlotDir = (Join-Path $PSScriptRoot "slots"),
     [Parameter(ValueFromRemainingArguments = $true)] [string[]] $Extra
 )
 
@@ -86,8 +91,10 @@ $Args_ = @(
     "--temp", "1.0", "--top-p", "0.95", "--top-k", "20",
     "--jinja",
     "--path", $WebUI,
-    "--slots"
+    "--slots",
+    "--slot-save-path", $SlotDir
 )
+New-Item -ItemType Directory -Force $SlotDir | Out-Null
 if ($Cpu) { $Args_ += @("-t", [Math]::Max(1, [Environment]::ProcessorCount / 2)) }
 if ($Mtp) {
     # One draft token per step: depth 2 accepts less and costs a second draft decode. -ctkd/-ctvd give the draft KV
@@ -125,6 +132,7 @@ Write-Host "  Context: $Ctx (KV cache K=$CacheK V=$CacheV)"
 if ($Mtp) { Write-Host ("  Spec:    MTP, 1 draft token per step, accept rule " + $(if ($Accept) { $Accept } else { "exact" })) }
 Write-Host ("  UI:      http://localhost:$Port" + $(if ($Lan) { "  (LAN: http://$((Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.*' } | Select-Object -First 1).IPAddress):$Port)" } else { "" }))
 Write-Host "  API:     http://localhost:$Port/v1/chat/completions"
+Write-Host "  Chats:   .\chat-cache.ps1 save / restore (files in $SlotDir)"
 Write-Host "  Ctrl+C stops the server."
 Write-Host ""
 
