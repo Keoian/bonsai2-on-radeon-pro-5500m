@@ -430,6 +430,21 @@ private:
     mtp_chain_entry * mtp_chain_entry_for(uint32_t n_tokens);
     uint32_t                mtp_chain_n_out = 0;
 
+    // ARC-LAB: small decode batches (speculative verify, draft catch-up) keep one graph per shape (n_tokens, n_outputs),
+    // each with its own scheduler and compute buffers, so a width that comes back reuses its graph and its tensor
+    // addresses (and with them the backend's captured graph) instead of rebuilding gf_res_prev on every width change
+    // env: LLAMA_GRAPH_CACHE=N (max entries, LRU, 0 = off)
+    struct graph_cache_entry {
+        uint32_t               key    = 0;
+        uint64_t               t_used = 0;
+        ggml_backend_sched_ptr sched;
+        llm_graph_result_ptr   res;
+    };
+    std::vector<graph_cache_entry> graph_cache;
+    uint32_t graph_cache_max  = 0;
+    uint64_t graph_cache_tick = 0;
+    graph_cache_entry * graph_cache_entry_for(uint32_t n_tokens, int32_t n_outputs, bool & is_new);
+
     // ARC-LAB: LLAMA_MTP_DRAFT_TIMING=1: per chain decode, whether its cached graph was reused (else why not) and the
     // host time of process_ubatch's parts; printed to stderr every 64 chain decodes
     struct mtp_chain_reuse_stats {

@@ -372,6 +372,13 @@ llama_context::llama_context(
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
+
+        const char * LLAMA_GRAPH_CACHE = getenv("LLAMA_GRAPH_CACHE");
+        graph_cache_max = LLAMA_GRAPH_CACHE && !graph_reuse_disable ? (uint32_t) std::max(0, atoi(LLAMA_GRAPH_CACHE)) : 0;
+
+        if (graph_cache_max > 0) {
+            LLAMA_LOG_INFO("%s: graph cache on: up to %u graphs for batches of <= 32 tokens\n", __func__, graph_cache_max);
+        }
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -712,6 +719,7 @@ void llama_context::sched_reserve() {
     synchronize();
 
     mtp_chain_cache.clear();  // ARC-LAB: built under the old settings
+    graph_cache.clear();
 
     const int64_t t_start_us = ggml_time_us();
 
@@ -959,6 +967,9 @@ bool llama_context::memory_update(bool optimize) {
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
         gf_res_prev->reset();
+        for (auto & e : graph_cache) {
+            e.res->reset();
+        }
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1480,6 +1491,40 @@ llama_context::mtp_chain_entry * llama_context::mtp_chain_entry_for(uint32_t n_t
                                          cparams.op_offload));
     e.res.reset(new llm_graph_result(max_nodes));
     return &(mtp_chain_cache[key] = std::move(e));
+}
+
+llama_context::graph_cache_entry * llama_context::graph_cache_entry_for(uint32_t n_tokens, int32_t n_outputs, bool & is_new) {
+    is_new = false;
+    // larger batches are prompt chunks: they stay on the main scheduler, reserved for n_ubatch
+    if (graph_cache_max == 0 || n_tokens > 32 || cparams.pipeline_parallel) {
+        return nullptr;
+    }
+    const uint32_t key = ((uint32_t) n_outputs << 16) | n_tokens;
+    graph_cache_entry * lru = nullptr;
+    for (auto & e : graph_cache) {
+        if (e.key == key) {
+            e.t_used = ++graph_cache_tick;
+            return &e;
+        }
+        if (!lru || e.t_used < lru->t_used) {
+            lru = &e;
+        }
+    }
+    if (lru && graph_cache.size() >= graph_cache_max) {
+        LLAMA_LOG_DEBUG("%s: evicting graph for n_tokens = %u, n_outputs = %u\n", __func__, lru->key & 0xffff, lru->key >> 16);
+        ggml_backend_sched_synchronize(lru->sched.get()); // its buffers may still be in use
+        graph_cache.erase(graph_cache.begin() + (lru - graph_cache.data()));
+    }
+    const size_t max_nodes = graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
+    graph_cache_entry e;
+    e.key    = key;
+    e.t_used = ++graph_cache_tick;
+    e.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false,
+                                         cparams.op_offload));
+    e.res.reset(new llm_graph_result(max_nodes));
+    graph_cache.push_back(std::move(e));
+    is_new = true;
+    return &graph_cache.back();
 }
 
 void llama_context::mtp_chain_reuse_stats::report() {
@@ -2274,7 +2319,40 @@ int llama_context::decode(const llama_batch & batch_inp) {
             std::swap(gf_res_prev, chain_e->res);
         }
 
+        // ARC-LAB: other small batches run on the cached scheduler + graph of their shape (graph_cache), swapped in
+        // until the outputs of this ubatch are read
+        bool cache_new = false;
+        graph_cache_entry * cache_e = chain_e ? nullptr : graph_cache_entry_for(ubatch.n_tokens, n_outputs, cache_new);
+        struct graph_cache_swap {
+            llama_context     * lctx;
+            graph_cache_entry * e;
+            graph_cache_swap(llama_context * c, graph_cache_entry * ce) : lctx(c), e(ce) { swap(); }
+            ~graph_cache_swap() { swap(); }
+            void swap() {
+                if (e) {
+                    std::swap(lctx->sched,       e->sched);
+                    std::swap(lctx->gf_res_prev, e->res);
+                }
+            }
+        } cache_swap(this, cache_e);
+
+        const int32_t n_reused_prev = n_reused;
+
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+
+        if (cache_e && res) {
+            if (cache_new) {
+                size_t size = 0;
+                for (auto * backend : backend_ptrs) {
+                    size += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+                }
+                LLAMA_LOG_INFO("%s: graph cache: new graph %zu/%u for n_tokens = %u, n_outputs = %d, compute buffers %.2f MiB\n",
+                        __func__, graph_cache.size(), graph_cache_max, ubatch.n_tokens, n_outputs, size / 1024.0 / 1024.0);
+            } else {
+                LLAMA_LOG_DEBUG("%s: graph cache: n_tokens = %u, n_outputs = %d, graph %s\n", __func__, ubatch.n_tokens, n_outputs,
+                        n_reused > n_reused_prev ? "reused" : "rebuilt");
+            }
+        }
 
         if (chain_e) {
             // the per-step argmax rows, mapped to tokens in get_mtp_chain_ids()
