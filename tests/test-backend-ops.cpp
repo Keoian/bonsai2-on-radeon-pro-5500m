@@ -11092,6 +11092,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+    // vec kernel with the GQA-6 group folded into one block: decode and the 2-token MTP verify, q8_0 K cache
+    for (int64_t kv : {256, 4096}) {
+        for (int64_t nb : {1, 2, 3}) {
+            for (ggml_type tv : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, tv, {0, 2, 1, 3}));
+            }
+        }
+    }
     // ARC-LAB: DPAS decode kernel (GGML_SYCL_FA_DEC_DPAS): longer verify batches (token chunks) and the real cache layout
     for (int64_t kv : {512, 4096}) {
         for (int64_t nb : {12, 16, 17, 32}) {
@@ -11834,9 +11842,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
         }
     }
-    for (int64_t kv : {256, 1024, 4096, 16384, 32768, 65536}) {  // Bonsai decode and MTP verify on the q8_0 K / q4_0 V cache, real cache layout
-        for (int64_t nb : {1, 2}) {
-            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
+    for (int64_t kv : {256, 1024, 4096, 16384, 32768, 65536}) {  // Bonsai decode and MTP verify on the q8_0 K / q4_0 or q8_0 V cache, real cache layout
+        for (int64_t nb : {1, 2, 3, 5}) {
+            for (ggml_type tv : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, tv, {0, 2, 1, 3}));
+            }
         }
     }
     for (ggml_type t : {GGML_TYPE_Q4_0, GGML_TYPE_F16}) {  // ARC-LAB: Bonsai 27B prompt batch at 16K history
