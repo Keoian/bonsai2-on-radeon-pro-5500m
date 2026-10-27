@@ -291,7 +291,7 @@ static __host__ int ptq1_0_pt_rows_per_cta(const int blocks_per_row, const int n
 #define PTQ1_0_PT_ROWS_58 4
 #endif
 #ifndef PTQ1_0_PT_MINB_58
-#define PTQ1_0_PT_MINB_58 2
+#define PTQ1_0_PT_MINB_58 3
 #endif
 static constexpr __host__ __device__ int ptq1_0_pt_rows_per_item(const int ncols_dst) {
     return ncols_dst <= 2 ? 4 : (ncols_dst <= 4 ? PTQ1_0_PT_ROWS_34 : PTQ1_0_PT_ROWS_58);
