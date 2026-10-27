@@ -11495,6 +11495,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Bonsai 2 projections at MTP verify widths (1-6 columns): what each extra verified token costs
+    for (auto mk : std::vector<std::array<int64_t, 2>>{{17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120},
+                                                       {12288, 5120}, {1024, 5120}, {5120, 6144}, {248320, 5120}}) {
+        for (int n : {1, 2, 3, 4, 5, 6}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
+        }
+    }
+    for (int n : {2, 3, 4, 5}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n, 1, 3));
+    }
+
     // ARC-LAB: Bonsai 2 GDN layer shape (16 k-heads x 128, 48 v-heads): prompt batch and decode
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 1, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1, 1, 3));

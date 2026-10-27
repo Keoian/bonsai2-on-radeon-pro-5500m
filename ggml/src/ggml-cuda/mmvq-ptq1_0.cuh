@@ -35,6 +35,9 @@
 #define PTQ1_0_PT_MAX_ROWS     16
 #define PTQ1_0_PT_MAX_COLS     8    // equals MMVQ_MAX_BATCH_SIZE, checked in mmvq.cu
 #define PTQ1_0_PT_SMEM_FLOATS  4096 // 16 KiB target when choosing rows per CTA; the launch may request more for one item
+#ifndef PTQ1_0_PT_SMEM_FLOATS_MC
+#define PTQ1_0_PT_SMEM_FLOATS_MC 8192
+#endif
 
 // the PT path is CUDA only; HIP keeps the block_q8_1 layout and the old vec_dot
 static constexpr __host__ __device__ bool ptq1_0_pt_enabled() {
@@ -251,7 +254,7 @@ static __device__ __forceinline__ void ptq1_0_pt_block_dot(
 
 // rows_per_cta: fill whole 128-thread iterations where possible, within the shared memory budget
 static __host__ int ptq1_0_pt_rows_per_cta(const int blocks_per_row, const int ncols_dst, const int nrows_x, const int rows_per_item) {
-    int rmax = PTQ1_0_PT_SMEM_FLOATS / (ncols_dst * (blocks_per_row + 1));
+    int rmax = (ncols_dst == 1 ? PTQ1_0_PT_SMEM_FLOATS : PTQ1_0_PT_SMEM_FLOATS_MC) / (ncols_dst * (blocks_per_row + 1));
     rmax = rmax < rows_per_item ? rows_per_item : (rmax > PTQ1_0_PT_MAX_ROWS ? PTQ1_0_PT_MAX_ROWS : rmax);
     rmax -= rmax % rows_per_item;
     int best = rows_per_item;
@@ -284,8 +287,14 @@ static __host__ int ptq1_0_pt_rows_per_cta(const int blocks_per_row, const int n
 
 // Same row-per-item rule the launcher instantiates. Multi-column paths retain
 // their existing 4/2-row schedule.
+#ifndef PTQ1_0_PT_ROWS_58
+#define PTQ1_0_PT_ROWS_58 4
+#endif
+#ifndef PTQ1_0_PT_MINB_58
+#define PTQ1_0_PT_MINB_58 2
+#endif
 static constexpr __host__ __device__ int ptq1_0_pt_rows_per_item(const int ncols_dst) {
-    return ncols_dst <= 2 ? 4 : (ncols_dst <= 4 ? PTQ1_0_PT_ROWS_34 : 2);
+    return ncols_dst <= 2 ? 4 : (ncols_dst <= 4 ? PTQ1_0_PT_ROWS_34 : PTQ1_0_PT_ROWS_58);
 }
 
 // The one-row tile is tuned on sm_86. Other devices keep the four-row baseline,
@@ -307,7 +316,7 @@ static __host__ size_t ptq1_0_pt_smem_bytes(const int blocks_per_row, const int 
 }
 
 template <int ncols, int ROWS, bool has_fusion, bool has_gate>
-__launch_bounds__(PTQ1_0_PT_THREADS, (ncols <= 2 ? 4 : (ncols <= 4 ? PTQ1_0_PT_MINB_34 : 2)))
+__launch_bounds__(PTQ1_0_PT_THREADS, (ncols <= 2 ? 4 : (ncols <= 4 ? PTQ1_0_PT_MINB_34 : PTQ1_0_PT_MINB_58)))
 static __global__ void mul_mat_vec_ptq1_0_pt(
         const void * vx_, const void * vy_, const ggml_cuda_mm_fusion_args_device fusion,
         float * dst_,
