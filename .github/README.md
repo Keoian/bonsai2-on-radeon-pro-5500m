@@ -135,9 +135,37 @@ dual-p100-qwen-3-8-27b 09a243185, where quality matched exact on that repo's cod
 The gain is smaller than on the P100 (+14-31%) because a step here drafts one token, so it can win at most 2.
 
 The head, its KV cache and the delta-net rollback state take about 1 GB of VRAM, so the context drops from 64k
-to 48k (52k is the most that fits). A Q8_0 head draws the same tokens and fits 40k. Drafting two tokens per
-step is slower on this card (14.9 vs 18.0 tok/s): the ternary mat-vec decodes the weights once per 2 columns,
-so verifying 3 tokens costs 128 ms against 86 ms for 2.
+to 48k (52k is the most that fits). A Q8_0 head draws the same tokens and fits 40k.
+
+#### Why one draft token per step
+
+Two draft tokens per step are slower on this card, although the head guesses the second token well. Measured at
+fb1d2f0df with 4 seeded prompts x 384 tokens, thinking on, temperature 1.0 / top-p 0.95 / top-k 20 / min-p 0.05,
+1 and 2 drafts alternated over two rounds (both rounds gave the same counts):
+
+| Drafts per step | 1 | 2 |
+|---|---|---|
+| Decode | **26.7 tok/s** | 16.4 tok/s |
+| Drafts accepted | 74.3% | first 77.0%, second 65.6% (when the first was kept) |
+| Tokens per step | 1.74 | 2.27 |
+| Time per step | 65 ms | 138 ms |
+
+A step costs one pass of the full model over the last token plus the drafts, and the pass gets much dearer at
+3 tokens (llama-bench, one batch):
+
+| Tokens in the pass | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|
+| Time | 51.7 ms | 57.4 ms | 116.6 ms | 134.2 ms |
+
+- The ternary mat-vec kernel for RDNA1 (`mul_mat_vecq_ptq1_0_w32.comp`) takes 1 or 2 columns: it decodes each
+  weight block once and uses it for both. A 3-token verify falls back to the general kernel and costs twice as much.
+- The head runs once per draft token, each time with a sampling round trip on the CPU: about 22 ms for two drafts,
+  8 ms for one. Chained drafts (`LLAMA_MTP_CHAIN=1`, all steps in one decode) only work for greedy drafts, not for
+  the sampled drafts the exact rule uses at a temperature above 0.
+
+To win, a two-draft step has to take less than 65 x 2.27 / 1.74 = 85 ms. A 3-column version of the kernel might
+verify in about 63 ms (a guess from the 1 -> 2 column cost), which with 22 ms of drafting is still about 85 ms:
+no gain unless the drafting also gets much cheaper.
 
 `-Lan` exposes an unauthenticated API. Only use it on a network you trust, or add `-- --api-key <key>`.
 

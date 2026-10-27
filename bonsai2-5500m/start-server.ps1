@@ -97,7 +97,7 @@ $Args_ = @(
 New-Item -ItemType Directory -Force $SlotDir | Out-Null
 if ($Cpu) { $Args_ += @("-t", [Math]::Max(1, [Environment]::ProcessorCount / 2)) }
 if ($Mtp) {
-    # One draft token per step: depth 2 accepts less and costs a second draft decode. -ctkd/-ctvd give the draft KV
+    # One draft token per step: two are slower here (16.4 vs 26.7 tok/s, see .github/README.md). -ctkd/-ctvd give the draft KV
     # cache the target's types (it is f16 otherwise), and a 128-row draft batch cuts its compute buffer from 130 to 35 MB.
     $Args_ += @("--spec-type", "draft-mtp", "--spec-draft-n-max", "1", "-ctkd", $CacheK, "-ctvd", $CacheV)
     if (-not $env:LLAMA_ARG_SPEC_DRAFT_UBATCH) { $env:LLAMA_ARG_SPEC_DRAFT_UBATCH = "128" }
