@@ -160,6 +160,11 @@
       <option value="exact">Exact: same output as without MTP</option>
       <option value="escape">Escape: faster, approximate</option>
     </select>
+    <label>Re-read each reply without its thinking</label>
+    <select id="reread">
+      <option value="now">Right after it, while you read (next turn starts sooner)</option>
+      <option value="later">With your next message</option>
+    </select>
 
     <h2>System prompt</h2>
     <textarea id="systemPrompt" placeholder="(optional)"></textarea>
@@ -197,7 +202,7 @@
     status: $('status'), messages: $('messages'), chat: $('chat'), input: $('input'), send: $('send'),
     settings: $('settings'), serverUrl: $('serverUrl'), serverInfo: $('serverInfo'), reasoning: $('reasoning'),
     effort: $('effort'), temp: $('temp'), topP: $('topP'), topK: $('topK'), minP: $('minP'), presence: $('presence'), maxTokens: $('maxTokens'), specAccept: $('specAccept'),
-    systemPrompt: $('systemPrompt'), theme: $('theme'), attachBtn: $('attachBtn'), fileInput: $('fileInput'),
+    reread: $('reread'), systemPrompt: $('systemPrompt'), theme: $('theme'), attachBtn: $('attachBtn'), fileInput: $('fileInput'),
     attachRow: $('attachRow'), attachPreview: $('attachPreview'), attachName: $('attachName'), attachClear: $('attachClear'),
   };
 
@@ -210,7 +215,7 @@
   const defaultServer = (location.protocol === 'http:' || location.protocol === 'https:') ? location.origin : 'http://localhost:8080';
   const settings = Object.assign({
     serverUrl: defaultServer, reasoning: '2048', effort: 'medium', temp: 1.0, topP: 0.95, topK: 20, minP: 0.05, presence: 0,
-    maxTokens: -1, specAccept: '', systemPrompt: '', theme: '',
+    maxTokens: -1, specAccept: '', reread: 'now', systemPrompt: '', theme: '',
   }, store.get('bonsai.settings', {}));
 
   const PRESET_THINK   = { temp: 1.0, topP: 0.95, topK: 20, minP: 0.05, presence: 0 };
@@ -220,7 +225,7 @@
     els.serverUrl.value = settings.serverUrl; els.reasoning.value = settings.reasoning; els.effort.value = settings.effort;
     els.temp.value = settings.temp; els.topP.value = settings.topP; els.topK.value = settings.topK; els.minP.value = settings.minP;
     els.presence.value = settings.presence; els.maxTokens.value = settings.maxTokens; els.specAccept.value = settings.specAccept;
-    els.systemPrompt.value = settings.systemPrompt; els.theme.value = settings.theme;
+    els.reread.value = settings.reread; els.systemPrompt.value = settings.systemPrompt; els.theme.value = settings.theme;
     document.documentElement.dataset.theme = settings.theme;
   }
   function readForm() {
@@ -229,7 +234,7 @@
     settings.temp = parseFloat(els.temp.value); settings.topP = parseFloat(els.topP.value);
     settings.topK = parseInt(els.topK.value, 10); settings.minP = parseFloat(els.minP.value); settings.presence = parseFloat(els.presence.value);
     settings.maxTokens = parseInt(els.maxTokens.value, 10); settings.specAccept = els.specAccept.value;
-    settings.systemPrompt = els.systemPrompt.value; settings.theme = els.theme.value;
+    settings.reread = els.reread.value; settings.systemPrompt = els.systemPrompt.value; settings.theme = els.theme.value;
     document.documentElement.dataset.theme = settings.theme;
     store.set('bonsai.settings', settings);
   }
@@ -381,10 +386,45 @@
         if (m.image) msgs.push({ role: 'user', content: [{ type: 'text', text: m.content }, { type: 'image_url', image_url: { url: m.image } }] });
         else msgs.push({ role: 'user', content: m.content });
       } else if (m.role === 'assistant' && m.content) {
-        msgs.push({ role: 'assistant', content: m.content });
+        // trimmed as the template trims it, so a reply sent last renders the same as it does later in the history
+        msgs.push({ role: 'assistant', content: m.content.trim() });
       }
     }
     return msgs;
+  }
+
+  function requestBody() {
+    const body = {
+      messages: apiMessages(),
+      temperature: settings.temp, top_p: settings.topP, top_k: settings.topK, min_p: settings.minP,
+      presence_penalty: settings.presence,
+      thinking_budget_tokens: parseInt(settings.reasoning, 10),
+    };
+    if (settings.specAccept) body['speculative.accept'] = settings.specAccept;
+    body.chat_template_kwargs = settings.reasoning === '0' ? { enable_thinking: false } : { reasoning_effort: settings.effort };
+    return body;
+  }
+
+  // the server caches a reply with its thinking, but the next turn sends it without, so the server reads the reply again
+  // do that now, while the user reads: send the history ending with the reply (a final assistant message is continued) and generate nothing
+  let rereadAbort = null;
+  async function reread(node) {
+    const body = requestBody();
+    const last = body.messages[body.messages.length - 1];
+    if (settings.reread !== 'now' || !last || last.role !== 'assistant' || !last.content) return;
+    body.max_tokens = 0;
+    rereadAbort = new AbortController();
+    try {
+      const r = await fetch(settings.serverUrl + '/v1/chat/completions', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: rereadAbort.signal,
+      });
+      const j = r.ok ? await r.json() : null;
+      const statsEl = node.querySelector('.stats');
+      if (j && j.timings && statsEl) {
+        statsEl.textContent += ' -- re-read for the next turn: ' + j.timings.prompt_n + ' tok in ' + (j.timings.prompt_ms / 1000).toFixed(0) + ' s';
+      }
+    } catch {}
+    rereadAbort = null;
   }
 
   async function send() {
@@ -396,8 +436,11 @@
     const reply = { role: 'assistant', content: '', reasoning: '', thinking: false };
     history.push(reply);
     renderAll();
+    const node = els.messages.lastElementChild;
     await stream(reply);
     saveHistory();
+    // not awaited; a message sent meanwhile waits on the server for the re-read and then reuses it
+    reread(node);
   }
 
   async function stream(reply) {
@@ -408,15 +451,9 @@
     let thinkEl = null, thinkBody = null, statsEl = null;
     const t0 = performance.now(); let firstTok = 0, ntok = 0, timings = null;
 
-    const body = {
-      messages: apiMessages(), stream: true, timings_per_token: false,
-      temperature: settings.temp, top_p: settings.topP, top_k: settings.topK, min_p: settings.minP,
-      presence_penalty: settings.presence,
-      thinking_budget_tokens: parseInt(settings.reasoning, 10),
-    };
+    const body = requestBody();
+    body.stream = true; body.timings_per_token = false;
     if (settings.maxTokens > 0) body.max_tokens = settings.maxTokens;
-    if (settings.specAccept) body['speculative.accept'] = settings.specAccept;
-    body.chat_template_kwargs = settings.reasoning === '0' ? { enable_thinking: false } : { reasoning_effort: settings.effort };
 
     const refresh = () => {
       bodyEl.innerHTML = md(reply.content);
@@ -483,7 +520,7 @@
   els.input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
   function autosize() { els.input.style.height = 'auto'; els.input.style.height = Math.min(els.input.scrollHeight, window.innerHeight * .4) + 'px'; }
   els.input.addEventListener('input', autosize);
-  $('newChat').onclick = () => { if (streaming && abort) abort.abort(); history = []; saveHistory(); renderAll(); els.input.focus(); };
+  $('newChat').onclick = () => { if (streaming && abort) abort.abort(); if (rereadAbort) rereadAbort.abort(); history = []; saveHistory(); renderAll(); els.input.focus(); };
 
   renderAll();
   els.input.focus();
