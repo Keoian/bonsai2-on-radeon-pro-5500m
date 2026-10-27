@@ -7,6 +7,27 @@
 // TODO optimize kernel parameters for FP16 NVIDIA (P100)
 // TODO optimize kernel parameters for head sizes 40, 72, 80, 96, 112
 
+// Configs of the GQA-fold-6 tile kernels (FP32 NVIDIA, D 256); the thread count must make ncols/nwarps 1, 2 or 4.
+// 24 columns: 384 threads, 2 blocks/SM (sweep on a GTX 1070; 192 threads 10% slower, 1 block/SM 25% slower).
+#ifndef GGML_CUDA_FA_TILE_G6_12_NTHREADS
+#define GGML_CUDA_FA_TILE_G6_12_NTHREADS 192
+#endif
+#ifndef GGML_CUDA_FA_TILE_G6_12_OCC
+#define GGML_CUDA_FA_TILE_G6_12_OCC 3
+#endif
+#ifndef GGML_CUDA_FA_TILE_G6_12_NBK
+#define GGML_CUDA_FA_TILE_G6_12_NBK 128
+#endif
+#ifndef GGML_CUDA_FA_TILE_G6_24_NTHREADS
+#define GGML_CUDA_FA_TILE_G6_24_NTHREADS 384
+#endif
+#ifndef GGML_CUDA_FA_TILE_G6_24_OCC
+#define GGML_CUDA_FA_TILE_G6_24_OCC 2
+#endif
+#ifndef GGML_CUDA_FA_TILE_G6_24_NBK
+#define GGML_CUDA_FA_TILE_G6_24_NBK 128
+#endif
+
 // The ROCm compiler cannot handle templating in __launch_bounds__.
 // As a workaround, define a macro to package the kernel parameters as uint32_t:
 #define GGML_CUDA_FATTN_TILE_CONFIG_CASE(DKQ_, DV_, ncols_, nthreads, occupancy, nbatch_fa, nbatch_K) \
@@ -72,6 +93,10 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  64,  64)
+
+    // GQA fold of 6, see the FP32 table; only selected on GPUs without fast FP16, defined so the kernels compile.
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 12, 192, 2,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 192, 2,  64,  64)
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 16, 256, 2,  64,  64)
 
@@ -141,6 +166,10 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 2,  32, 128)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  32,  64)
+
+    // 12 and 24 columns: GQA fold of 6 (2 or 4 Q columns x 6 heads), only used by the in-place q8_0/q4_0 kernels.
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 12, GGML_CUDA_FA_TILE_G6_12_NTHREADS, GGML_CUDA_FA_TILE_G6_12_OCC, 32, GGML_CUDA_FA_TILE_G6_12_NBK)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, GGML_CUDA_FA_TILE_G6_24_NTHREADS, GGML_CUDA_FA_TILE_G6_24_OCC, 32, GGML_CUDA_FA_TILE_G6_24_NBK)
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 16, 256, 2,  32,  64)
 
@@ -1430,9 +1459,40 @@ static void launch_fattn_tile_kv_in_place(ggml_backend_cuda_context & ctx, ggml_
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
 
-    // only GQA folds of 2 and 1 are instantiated for the in-place kernels
-    const int gqa_ratio = Q->ne[2] / K->ne[2];
-    if (mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0 && gqa_ratio % 2 == 0) {
+    // GQA folds of 6, 2 and 1 are instantiated for the in-place kernels.
+    // GGML_CUDA_FA_TILE_GQA=N caps the fold; the fold of 6 is used for up to GGML_CUDA_FA_TILE_GQA6_MAX (default 4) Q columns:
+    // at 16384 KV a 3-token verify takes 1039 us vs 1580 with a fold of 2, 5 tokens (2 blocks of 4) are no faster.
+    static const int fold_cap = getenv("GGML_CUDA_FA_TILE_GQA") ? atoi(getenv("GGML_CUDA_FA_TILE_GQA")) : 6;
+    static const int g6_max   = getenv("GGML_CUDA_FA_TILE_GQA6_MAX") ? atoi(getenv("GGML_CUDA_FA_TILE_GQA6_MAX")) : 4;
+
+    const int  gqa_ratio = Q->ne[2] / K->ne[2];
+    const bool gqa_opt   = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+#ifndef GGML_USE_HIP
+    if (gqa_opt && fold_cap >= 6 && gqa_ratio % 6 == 0 && Q->ne[1] <= g6_max &&
+            !fast_fp16_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        // 2 or 4 Q columns x 6 heads per block: each K/V tile is dequantized once for all heads that share it.
+        const int warp_size = 32;
+        if (Q->ne[1] <= 2) {
+            constexpr int cols_per_block = 12;
+            const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+            const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+            const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/6, 6, false, type_K, type_V>;
+            launch_fattn<DV, cols_per_block/6, 6>
+                (ctx, dst, fattn_kernel, nwarps, 0, nbatch_fa, false, false, false, warp_size);
+        } else {
+            constexpr int cols_per_block = 24;
+            const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+            const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+            const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/6, 6, false, type_K, type_V>;
+            launch_fattn<DV, cols_per_block/6, 6>
+                (ctx, dst, fattn_kernel, nwarps, 0, nbatch_fa, false, false, false, warp_size);
+        }
+        return;
+    }
+#endif // GGML_USE_HIP
+    if (gqa_opt && fold_cap >= 2 && gqa_ratio % 2 == 0) {
         launch_fattn_tile_switch_ncols1<DKQ, DV, 2, false, type_K, type_V>(ctx, dst);
     } else {
         launch_fattn_tile_switch_ncols1<DKQ, DV, 1, false, type_K, type_V>(ctx, dst);

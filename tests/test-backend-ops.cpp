@@ -11100,6 +11100,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // tile kernel with the GQA-6 group folded into one block (in-place q8_0 K cache), 3-9 query tokens
+    for (int64_t kv : {256, 4096}) {
+        for (int64_t nb : {3, 4, 5, 7, 8, 9}) {
+            for (ggml_type tv : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, tv));
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, true,  0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, tv, {0, 2, 1, 3}));
+            }
+        }
+    }
     // ARC-LAB: DPAS decode kernel (GGML_SYCL_FA_DEC_DPAS): longer verify batches (token chunks) and the real cache layout
     for (int64_t kv : {512, 4096}) {
         for (int64_t nb : {12, 16, 17, 32}) {
