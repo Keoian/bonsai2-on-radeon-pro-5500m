@@ -2521,6 +2521,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool                 iso_on = false;
     common_spec_stop_iso iso;
     std::vector<float>   s_iso;
+    // LLAMA_SPEC_ISO_EARLY=1: stop once the survival of the drafted prefix prod iso_q(q_i) < theta, decided before the
+    // next draft decode. The full rule needs step d's p1, so every early stop costs one decoded and discarded draft step
+    // (the draft head attends over the whole context: ~3-5 ms per wasted step at 8-16k tokens on a GTX 1070).
+    const bool           iso_early = [] { const char * e = getenv("LLAMA_SPEC_ISO_EARLY"); return e && atoi(e) != 0; }();
 
     bool can_defer() const {
         return !is_mem_shared && !chain_heads && !getenv("LLAMA_MTP_EAGER_CATCHUP");
@@ -3222,7 +3226,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // only collect very high-confidence draft tokens (p-min and the stop rule are fitted for the exact accept rule)
-                const bool by_iso = iso_on && s_iso[seq_id]*iso.lookup(iso.p1, p1) < iso.theta;
+                const bool by_iso = iso_on && !iso_early && s_iso[seq_id]*iso.lookup(iso.p1, p1) < iso.theta;
                 if (!dp.accept_approx && (iso_on ? by_iso : p1 < params.p_min)) {
                     if (dp.trace) {
                         dp.trace->back().stop = by_iso ? "iso" : "p_min";
@@ -3263,6 +3267,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (std::min((int) params.n_max, common_lab_knob("LAB_SPEC_DRAFT_N_MAX", params.n_max)) <= (int) result.size()) {
                     if (dp.trace) {
                         dp.trace->back().stop = "n_max";
+                    }
+                    drafting[seq_id] = false;
+                    n_drafting--;
+                    continue;
+                }
+
+                if (iso_on && iso_early && s_iso[seq_id] < iso.theta) {
+                    if (dp.trace) {
+                        dp.trace->back().stop = "iso_early";
                     }
                     drafting[seq_id] = false;
                     n_drafting--;
