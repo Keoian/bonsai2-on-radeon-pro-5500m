@@ -30,9 +30,12 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <map>
 #include <random>
+#include <sstream>
+#include <stdexcept>
 
 // ARC-LAB: lab knobs from GGML_SYCL_KNOBS_FILE (lines NAME=V, re-read when the file changes) so one server can A/B
 // speculative settings: LAB_SPEC_DRAFT_N_MAX caps the MTP draft below --spec-draft-n-max, LAB_SPEC_NGRAM_START replaces
@@ -2382,6 +2385,77 @@ static llama_token common_speculative_sample_draft_as_target(const llama_token_d
     return q[k].id;
 }
 
+// MTP learned stop rule (ref: P100 fork, CHANGES 22): do not add drafted token d when
+// S(d) = prod_{i<d} iso_q(q_i) * iso_p1(p1_d) < theta. q_i is the draft's probability of the token it drafted at step i,
+// p1_d the top-1 p of step d's candidates; iso_q and iso_p1 are isotonic fits of the target's acceptance on traced
+// cycles. The decision for step d never looks at the token drawn at step d, so the speculative-sampling rule stays exact.
+float common_spec_stop_iso::lookup(const std::vector<float> & tab, float v) const {
+    if (v <= x[0]) {
+        return tab[0];
+    }
+    for (size_t j = 1; j < x.size(); ++j) {
+        if (v <= x[j]) {
+            const float t = (v - x[j - 1]) / (x[j] - x[j - 1]);
+            return tab[j - 1] + t*(tab[j] - tab[j - 1]);
+        }
+    }
+    return tab.back();
+}
+
+common_spec_stop_iso common_spec_stop_iso_load(const std::string & path, float theta) {
+    // placeholders: Qwen3.8-27B UD-Q6_K, thinking-off sampling, sampled drafts at T 1.0 (P100 fork, theta 0.125)
+    common_spec_stop_iso r;
+    r.theta = 0.125f;
+    r.x  = { 0.000f, 0.020f, 0.050f, 0.100f, 0.150f, 0.200f, 0.250f, 0.300f, 0.350f, 0.400f, 0.450f, 0.500f,
+             0.550f, 0.600f, 0.650f, 0.700f, 0.750f, 0.800f, 0.850f, 0.900f, 0.950f, 0.980f, 0.995f, 1.000f };
+    r.q  = { 0.000f, 0.115f, 0.147f, 0.231f, 0.250f, 0.267f, 0.299f, 0.299f, 0.299f, 0.321f, 0.350f, 0.389f,
+             0.402f, 0.419f, 0.419f, 0.419f, 0.437f, 0.503f, 0.530f, 0.570f, 0.603f, 0.734f, 0.821f, 0.994f };
+    r.p1 = { 0.000f, 0.000f, 0.000f, 0.000f, 0.100f, 0.156f, 0.156f, 0.200f, 0.200f, 0.209f, 0.248f, 0.325f,
+             0.328f, 0.369f, 0.369f, 0.369f, 0.399f, 0.431f, 0.502f, 0.522f, 0.573f, 0.708f, 0.812f, 0.994f };
+
+    if (!path.empty()) {
+        std::ifstream f(path);
+        if (!f) {
+            throw std::runtime_error("cannot open stop rule tables '" + path + "'");
+        }
+        r = {};
+        std::string line;
+        while (std::getline(f, line)) {
+            std::istringstream ss(line);
+            std::string key;
+            if (!(ss >> key) || key[0] == '#') {
+                continue;
+            }
+            std::vector<float> v;
+            for (float t; ss >> t;) {
+                v.push_back(t);
+            }
+            if (key == "theta" && v.size() == 1) {
+                r.theta = v[0];
+            } else if (key == "x") {
+                r.x = v;
+            } else if (key == "q") {
+                r.q = v;
+            } else if (key == "p1") {
+                r.p1 = v;
+            } else {
+                throw std::runtime_error("stop rule tables '" + path + "': bad line '" + line + "'");
+            }
+        }
+        bool ok = r.x.size() >= 2 && r.q.size() == r.x.size() && r.p1.size() == r.x.size();
+        for (size_t j = 1; ok && j < r.x.size(); ++j) {
+            ok = r.x[j] > r.x[j - 1];
+        }
+        if (!ok) {
+            throw std::runtime_error("stop rule tables '" + path + "': x, q, p1 need the same length >= 2 and x increasing");
+        }
+    }
+    if (theta > 0.0f) {
+        r.theta = theta;
+    }
+    return r;
+}
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
@@ -2442,6 +2516,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // next step on the device, and the n draft tokens are read back once, instead of n decodes with a host sample in
     // between. Same greedy drafts and the same draft K/V as the loop below. Set in the ctor.
     bool chain_mode = false;
+
+    // learned stop rule (--spec-draft-stop-iso, --spec-draft-stop-iso-file); s_iso: estimated survival of the drafted prefix
+    bool                 iso_on = false;
+    common_spec_stop_iso iso;
+    std::vector<float>   s_iso;
 
     bool can_defer() const {
         return !is_mem_shared && !chain_heads && !getenv("LLAMA_MTP_EAGER_CATCHUP");
@@ -2555,6 +2634,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         deferred.assign(n_seq, {});
 
+        iso_on = this->params.stop_iso > 0.0f || !this->params.stop_iso_file.empty();
+        if (iso_on) {
+            iso = common_spec_stop_iso_load(this->params.stop_iso_file, this->params.stop_iso);
+            iso_on = iso.theta > 0.0f;
+            SPC_INF("MTP stop rule %s: theta %.3f, %zu points, tables %s\n", iso_on ? "on" : "off (theta <= 0)", iso.theta, iso.x.size(),
+                    this->params.stop_iso_file.empty() ? "built-in (placeholder)" : this->params.stop_iso_file.c_str());
+        }
+        s_iso.assign(n_seq, 1.0f);
+
         // chained drafts: default OFF for now (B580, 2026-10-10: identical drafts but -0.2..-0.8%, the chain graph is rebuilt
         // on every draft; revisit with graph reuse). LLAMA_MTP_CHAIN=1 turns it on. Greedy single-sequence drafting only.
         {
@@ -2572,6 +2660,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 why = "more than one sequence";
             } else if (this->params.p_min > 0.0f) {
                 why = "p_min > 0";
+            } else if (iso_on || !this->params.trace_file.empty()) {
+                why = "stop rule or trace (need per-step probabilities)";
             }
             chain_mode = why == nullptr;
             if (chain_mode) {
@@ -3006,6 +3096,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
             dp.dists.clear();
+            s_iso[seq_id] = 1.0f;
+            if (dp.trace) {
+                dp.trace->clear();
+            }
 
             // catch-up rows ride in the same decode as the first draft row (no logits)
             auto & d = deferred[seq_id];
@@ -3116,18 +3210,48 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto & dp = dparams.at(seq_id);
 
-                // only collect very high-confidence draft tokens (p-min is fitted for the exact accept rule)
-                if (!dp.accept_approx && cur_p->data[0].p < params.p_min) {
+                const float p1 = cur_p->data[0].p;
+                if (dp.trace) {
+                    double H = 0.0;
+                    for (size_t k = 0; k < cur_p->size; ++k) {
+                        if (cur_p->data[k].p > 0.0f) {
+                            H -= (double) cur_p->data[k].p*std::log((double) cur_p->data[k].p);
+                        }
+                    }
+                    dp.trace->push_back({ id, p1, p1, (float) H, nullptr });
+                }
+
+                // only collect very high-confidence draft tokens (p-min and the stop rule are fitted for the exact accept rule)
+                const bool by_iso = iso_on && s_iso[seq_id]*iso.lookup(iso.p1, p1) < iso.theta;
+                if (!dp.accept_approx && (iso_on ? by_iso : p1 < params.p_min)) {
+                    if (dp.trace) {
+                        dp.trace->back().stop = by_iso ? "iso" : "p_min";
+                    }
                     drafting[seq_id] = false;
                     n_drafting--;
 
                     continue;
                 }
 
-                if (dp.accept_approx && dp.sample_temp > 0.0f) {
-                    id = common_speculative_sample_draft_as_target(cur_p, dp, sample_rngs[seq_id], dp.dists.emplace_back());
-                } else if (dp.sample_temp > 0.0f) {
-                    id = common_speculative_sample_draft(cur_p, dp.sample_temp, dp.sample_top_p, sample_rngs[seq_id], dp.dists.emplace_back());
+                float q_id = p1; // the draft's probability of the token it drafts
+                if (dp.sample_temp > 0.0f) {
+                    auto & q = dp.dists.emplace_back();
+                    id = dp.accept_approx
+                        ? common_speculative_sample_draft_as_target(cur_p, dp, sample_rngs[seq_id], q)
+                        : common_speculative_sample_draft(cur_p, dp.sample_temp, dp.sample_top_p, sample_rngs[seq_id], q);
+                    for (const auto & c : q) {
+                        if (c.id == id) {
+                            q_id = c.p;
+                            break;
+                        }
+                    }
+                    if (dp.trace) {
+                        dp.trace->back().id = id;
+                        dp.trace->back().q  = q_id;
+                    }
+                }
+                if (iso_on) {
+                    s_iso[seq_id] *= iso.lookup(iso.q, q_id);
                 }
 
                 common_sampler_accept(smpl, id, true);
@@ -3137,6 +3261,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 result.push_back(id);
 
                 if (std::min((int) params.n_max, common_lab_knob("LAB_SPEC_DRAFT_N_MAX", params.n_max)) <= (int) result.size()) {
+                    if (dp.trace) {
+                        dp.trace->back().stop = "n_max";
+                    }
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;

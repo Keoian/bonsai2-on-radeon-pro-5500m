@@ -4172,6 +4172,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
     add_opt(common_arg(
+        {"--spec-draft-stop-iso"}, "THETA",
+        "MTP: stop drafting when the estimated survival of the drafted prefix falls below THETA, instead of p-min\n"
+        "(0 = off unless --spec-draft-stop-iso-file is set, then the file's theta)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.stop_iso = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_STOP_ISO"));
+    add_opt(common_arg(
+        {"--spec-draft-stop-iso-file"}, "FNAME",
+        "MTP: stop rule tables (lines \"theta T\", \"x ...\", \"q ...\", \"p1 ...\"); turns the stop rule on",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.stop_iso_file = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_STOP_ISO_FILE"));
+    add_opt(common_arg(
+        {"--spec-trace"}, "FNAME",
+        "append one JSON line per speculative verify cycle to FNAME (MTP draft and target features, for fitting the stop rule)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.trace_file = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_TRACE"));
+    add_opt(common_arg(
         {"--spec-accept"}, "RULE",
         "how sampled drafts are accepted, the default for requests (per request: \"speculative.accept\"):\n"
         "exact: output distributed as the target's own sampling (default)\n"

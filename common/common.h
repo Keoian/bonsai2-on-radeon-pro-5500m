@@ -333,6 +333,12 @@ struct common_params_speculative_draft {
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
+    // MTP learned stop rule (replaces p_min when on): stop when prod_{i<d} iso_q(q_i) * iso_p1(p1_d) < theta
+    float       stop_iso      = 0.0f; // theta (0 = the file's theta, or off without a file)
+    std::string stop_iso_file = "";   // tables "theta/x/q/p1" lines; empty = the built-in placeholder tables
+
+    std::string trace_file = ""; // server: one JSON line per verify cycle (draft and target features), for fitting the stop rule
+
     // stop drafting once the sequence is this long (0 = never). Deep in the context a step is bound
     // by reading the KV cache, and the draft passes plus the multi-column verify add to that read
     // without shortening it: on a 4070 with Bonsai 2 27B the draft is +85% at zero depth, breaks

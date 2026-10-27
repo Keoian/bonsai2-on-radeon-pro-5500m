@@ -215,6 +215,13 @@ struct server_slot {
     bool spec_is_replay = false;
     std::mt19937 spec_dist_rng; // accept/reject draws of the speculative-sampling rule
 
+    // fixed-width verify: the draft is padded to n_max and only its first spec_n_real tokens are real (-1: not padded)
+    int spec_n_real = -1;
+
+    // --spec-trace: the draft steps of this cycle, and the end of the previous cycle of this task (0: none)
+    std::vector<common_speculative_trace_step> spec_trc_draft;
+    int64_t spec_trc_t_prev = 0;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -340,6 +347,8 @@ struct server_slot {
             spec_draft.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
+            spec_n_real     = -1;
+            spec_trc_t_prev = 0;
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -698,6 +707,81 @@ struct server_slot {
     }
 };
 
+// --spec-trace: one JSON line per verify cycle. For each real drafted token: what the draft saw (q, top-1 p1, entropy)
+// and the target's p of it, teacher-forced along the drafted tokens on a clone of the pre-verify sampler, so the rows
+// past the first rejection are labelled too. a is the acceptance probability the stop rule fits: min(1, p/q) for
+// sampled drafts, the match for a greedy target, else p. Call before slot.spec_i_batch and slot.spec_draft change.
+static void server_spec_trace_write(FILE * f, server_slot & slot, common_sampler * smpl_save, bool use_dist,
+        const std::vector<std::vector<llama_token_data>> & dists, size_t n_real, size_t n_accepted, int64_t draft_us) {
+    const float temp = slot.task->params.sampling.temp;
+    const auto & drf = slot.spec_trc_draft;
+
+    std::string s;
+    char tmp[128];
+    snprintf(tmp, sizeof(tmp), "{\"task\":%d,\"slot\":%d,\"pos0\":%d,\"n_draft\":%zu,\"n_real\":%zu,\"temp\":%.6g,\"rule\":\"%s\",\"draft\":[",
+            slot.task->id, slot.id, (int) slot.prompt.tokens.pos_next() - (int) slot.spec_draft.size() - 1,
+            slot.spec_draft.size(), n_real, temp, use_dist ? "dist" : "greedy");
+    s += tmp;
+
+    common_sampler_ptr smpl(common_sampler_clone(smpl_save));
+    bool teacher = true;
+
+    // the real drafted steps, then the step that stopped drafting, if its token was not added
+    const size_t n_steps = std::min(drf.size(), n_real + 1);
+    for (size_t i = 0; i < n_steps; ++i) {
+        const auto & d = drf[i];
+        snprintf(tmp, sizeof(tmp), "%s{\"id\":%d,\"q\":%.6g,\"p1\":%.6g,\"H\":%.6g", i ? "," : "", d.id, d.q, d.p1, d.H);
+        s += tmp;
+        if (d.stop) {
+            s += ",\"stop\":\""; s += d.stop; s += "\"";
+        }
+        if (i < n_real && teacher) {
+            const llama_token tok = slot.spec_draft[i];
+            try {
+                const llama_token id = common_sampler_sample(smpl.get(), slot.ctx_tgt, slot.spec_i_batch[i]);
+                const auto * cur_p = common_sampler_get_candidates(smpl.get(), false);
+                float p = 0.0f;
+                for (size_t k = 0; k < cur_p->size; ++k) {
+                    if (cur_p->data[k].id == tok) {
+                        p = cur_p->data[k].p;
+                        break;
+                    }
+                }
+                float a = temp <= 0.0f ? (float) (id == tok) : p;
+                if (use_dist && i < dists.size()) {
+                    float q = 0.0f;
+                    for (const auto & c : dists[i]) {
+                        if (c.id == tok) {
+                            q = c.p;
+                            break;
+                        }
+                    }
+                    a = q > 0.0f ? std::min(1.0f, p/q) : 0.0f;
+                }
+                snprintf(tmp, sizeof(tmp), ",\"t_id\":%d,\"p\":%.6g,\"a\":%.6g", id, p, a);
+                s += tmp;
+                common_sampler_accept(smpl.get(), tok, true);
+            } catch (const std::exception &) {
+                // the grammar rejected a drafted token: no teacher rows from here on
+                teacher = false;
+            }
+        }
+        s += "}";
+    }
+
+    const int64_t t_now = ggml_time_us();
+    snprintf(tmp, sizeof(tmp), "],\"n_accepted\":%zu,\"draft_us\":%" PRId64, n_accepted, draft_us);
+    s += tmp;
+    if (slot.spec_trc_t_prev > 0) {
+        snprintf(tmp, sizeof(tmp), ",\"cycle_us\":%" PRId64, t_now - slot.spec_trc_t_prev);
+        s += tmp;
+    }
+    s += "}\n";
+    fputs(s.c_str(), f);
+    fflush(f);
+    slot.spec_trc_t_prev = t_now;
+}
+
 // returns 0 on success
 // caller need to update prompt.tokens after a successful call to keep track of the processing progress
 // note: this is not a member of server_slot because we want to run it inside yield_to_queue
@@ -857,6 +941,10 @@ private:
 
     common_speculative_ptr spec;
 
+    bool    spec_pad   = false;   // verify at a fixed width, padding short drafts (LLAMA_SPEC_PAD; default: with the MTP stop rule)
+    FILE *  spec_trace = nullptr; // --spec-trace
+    int64_t spec_trc_draft_us = 0;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -900,6 +988,11 @@ private:
     void destroy() {
         spec.reset();
         spec_init.reset();
+
+        if (spec_trace) {
+            fclose(spec_trace);
+            spec_trace = nullptr;
+        }
 
         ctx_dft   = nullptr;
         model_dft = nullptr;
@@ -1195,6 +1288,24 @@ private:
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+
+                // fixed-width verify: pad short drafts to n_max, so the verify graph keeps one shape and is reused.
+                // One slot only. The padded tokens are computed and rejected like any other wrong draft
+                const auto & sd = params_base.speculative.draft;
+                const char * e_pad = getenv("LLAMA_SPEC_PAD");
+                spec_pad = params_base.n_parallel == 1 && (e_pad ? atoi(e_pad) != 0 : sd.stop_iso > 0.0f || !sd.stop_iso_file.empty());
+                if (spec_pad) {
+                    SRV_INF("speculative verify padded to %d drafted tokens (LLAMA_SPEC_PAD=0 turns it off)\n", common_speculative_n_max(&params_base.speculative));
+                }
+                if (!sd.trace_file.empty() && !spec_trace) {
+                    spec_trace = fopen(sd.trace_file.c_str(), "a");
+                    if (spec_trace) {
+                        SRV_WRN("speculative trace: appending to '%s'\n", sd.trace_file.c_str());
+                    } else {
+                        SRV_ERR("speculative trace: cannot open '%s'\n", sd.trace_file.c_str());
+                    }
+                }
+
                 if (params_base.speculative.accept.approx()) {
                     SRV_WRN("speculative accept rule '%s' by default (approximate: drafts the model would not have sampled "
                             "are kept; requests can set \"speculative.accept\": \"exact\")\n",
@@ -2984,6 +3095,7 @@ private:
                         // penalty sampler never saw them
                         auto & dpr = common_speculative_get_draft_params(spec.get(), slot.id);
                         dpr.accept_approx = sample_draft && slot.task->params.speculative.accept.approx();
+                        dpr.trace = spec_trace ? &slot.spec_trc_draft : nullptr;
                         if (dpr.accept_approx) {
                             dpr.target_top_k      = sp.top_k;
                             dpr.target_min_p      = sp.min_p;
@@ -3010,9 +3122,11 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            const int64_t t_d0 = spec_trace ? ggml_time_us() : 0;
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            spec_trc_draft_us = spec_trace ? ggml_time_us() - t_d0 : 0;
         }
 
         // make checkpoints if needed
@@ -3020,7 +3134,18 @@ private:
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
 
-            slot.stats.n_draft_tokens += draft.size();
+            // pad a short draft to n_max, so that the verify always has one width and its graph is reused
+            slot.spec_n_real = -1;
+            if (spec_pad) {
+                const int n_max  = common_speculative_n_max(&params_base.speculative);
+                const int n_real = (int) draft.size();
+                if (n_real < n_max && n_max <= slot.get_n_draft_max()) {
+                    draft.resize(n_max, draft.empty() ? slot.sampled : draft.back());
+                    slot.spec_n_real = n_real;
+                }
+            }
+
+            slot.stats.n_draft_tokens += slot.spec_n_real >= 0 ? slot.spec_n_real : (int) draft.size();
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -3897,10 +4022,19 @@ private:
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 // a replay re-verifies tokens that are already decided, with the target's own samples
                 const auto & dists = common_speculative_get_draft_params(spec.get(), slot.id).dists;
-                auto accepted = !slot.spec_is_replay && dists.size() >= n_draft
-                    ? common_sampler_sample_and_accept_n_dist(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, dists, slot.spec_dist_rng,
+                // padded verify: only the first n_real drafts (and their outputs) are real
+                const size_t n_real = !slot.spec_is_replay && slot.spec_n_real >= 0 ? (size_t) slot.spec_n_real : n_draft;
+                const llama_tokens     draft_real(slot.spec_draft.begin(), slot.spec_draft.begin() + n_real);
+                const std::vector<int> idxs_real(slot.spec_i_batch.begin(), slot.spec_i_batch.begin() + n_real + 1);
+                const bool use_dist = !slot.spec_is_replay && !dists.empty() && dists.size() >= n_real;
+                auto accepted = use_dist
+                    ? common_sampler_sample_and_accept_n_dist(slot.smpl.get(), slot.ctx_tgt, idxs_real, draft_real, dists, slot.spec_dist_rng,
                             slot.task->params.speculative.accept)
-                    : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                    : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, idxs_real, draft_real);
+                if (spec_trace && !slot.spec_is_replay) {
+                    server_spec_trace_write(spec_trace, slot, smpl_save.get(), use_dist, dists, n_real, accepted.size() - 1, spec_trc_draft_us);
+                }
+                slot.spec_n_real = -1;
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
