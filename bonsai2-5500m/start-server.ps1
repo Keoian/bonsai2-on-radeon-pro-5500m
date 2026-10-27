@@ -10,7 +10,7 @@
   .\start-server.ps1 -Cpu            # CPU only (PQ2_0), for machines without a usable GPU
   .\start-server.ps1 -Parallel 2    # more concurrent chats (each slot costs VRAM; 1 fits the 8 GB 5500M)
   .\start-server.ps1 -Ctx 16384 -NoVision -- --reasoning-budget 2048   # extra llama-server flags after --
-  .\start-server.ps1 -Mtp            # MTP speculative decoding: +20-35% decode, 48k context (run graft-mtp.py once first)
+  .\start-server.ps1 -Mtp            # MTP speculative decoding: about +40% decode, 48k context (run graft-mtp.py once first)
   .\start-server.ps1 -Mtp -Accept escape   # also keep drafts the model could have sampled (approximate, faster)
 
   .\start-server.ps1 -ModelDir D:\models   # where the .gguf files live (see below)

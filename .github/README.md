@@ -98,6 +98,25 @@ A 21,500-token recall test also passed with the default: the model found a code 
 
 For full-precision cache use `-CacheK f16 -CacheV f16 -Ctx 16384`. On a card with more VRAM, raise `-Ctx`.
 
+### Keeping a chat across a server restart
+
+The server keeps recent chats in system RAM (up to 8 GB, one context's worth of tokens), but loses them when it
+stops. Without them, the first message after a restart reads the whole chat again, at about 25-35 tokens/s here
+(15+ minutes for a 30k-token chat). The launcher passes `--slot-save-path` (`-SlotDir`, default `bonsai2-5500m\slots`,
+ignored by git), so the current chat can be saved to disk and loaded back:
+
+```
+.\bonsai2-5500m\chat-cache.ps1 save          # before stopping the server: writes slots\chat.bin
+.\bonsai2-5500m\chat-cache.ps1 restore       # after starting it again, before the next message
+.\bonsai2-5500m\chat-cache.ps1 save work     # a named file, slots\work.bin
+.\bonsai2-5500m\chat-cache.ps1 list
+```
+
+A file holds the KV cache, the Gated DeltaNet checkpoints (about 150 MiB each, so 1-2 GB for a long chat) and the MTP
+draft state, and it only loads into a server started with the same model, KV cache types and `-Mtp` setting. On the
+5500M a short chat saved (601 MiB) in 0.7 s and restored in 0.5 s. This uses two upstream llama.cpp server changes,
+cherry-picked here: checkpoints in the slot file (#26004) and the draft state in the slot file (#30574).
+
 ### MTP speculative decoding
 
 `-Mtp` adds a one-layer draft head (multi-token prediction) that guesses the next token. The full model checks
@@ -112,10 +131,23 @@ python bonsai2-5500m\graft-mtp.py
 .\bonsai2-5500m\start-server.ps1 -Mtp          # 48k context
 ```
 
-| Server decode, 3-4 prompts, 128-256 tokens | No MTP | MTP |
+| Server decode at a23daef20, short context, cool GPU | No MTP | MTP |
 |---|---|---|
-| greedy | 14.2-14.6 tok/s | 16.8-19.7 tok/s, 70-96% of drafts accepted |
-| temperature 1.0 (model card) | 14.1-14.2 tok/s | 17.96 tok/s, 76% accepted (17.31 and 70% with greedy drafts) |
+| greedy, 4 prompts x 128 tokens, thinking off | 19.15 tok/s | 26.96 tok/s |
+| temperature 1.0 / top-p 0.95 / top-k 20 / min-p 0.05, 4 prompts x 200 tokens x 3 rounds | | 26.55 tok/s, 75.3% accepted |
+| same sampling, thinking on, 4 prompts x 384 tokens (fb1d2f0df) | | 26.7 tok/s, 74.3% accepted |
+
+Without MTP the sampling settings barely matter: llama-bench tg64 gives 19.05-19.15 tok/s on the same build. Before
+the RDNA1 decode kernels of 2026-10-26 (decode flash attention, the ternary mat-vec, the Hadamard/norm/gate fusions)
+the same kind of runs gave 14.2-14.6 tok/s without MTP and 16.8-19.7 with it (greedy), and 17.96 tok/s with MTP at
+temperature 1.0. On real chat turns with thinking (1.4k-9.8k tokens of context) 70.6-73.9% of drafts were accepted.
+
+Long replies are slower, because the laptop throttles. After about 80 s of nonstop decoding the GPU falls into a
+~20 s cycle with ~9 s at 6-8 tok/s (without MTP: 17.3 tok/s cool, about 9.5 tok/s on average in the cycling phase).
+On a fan pad, 60 short replies in a row averaged 15.0 tok/s against 11.2 without it (the battery also stopped
+charging in between). With MTP on the fan pad, 14 back-to-back 512-token replies averaged 20.3 tok/s (26.6 for the
+first, about 21 after two minutes), and one 16-minute, 18,273-token reply at 10k-28k tokens of context averaged
+18.6 tok/s. A longer context also slows attention.
 
 At a temperature above 0 the head samples its guess at the request's temperature and top-p, and the server
 accepts it with the speculative-sampling rule (min(1, p/q)), which accepts more drafts than matching the
@@ -125,7 +157,8 @@ argmax. `LLAMA_SPEC_SAMPLE_DRAFT=0` turns that off.
 faster but **approximate**: it keeps a draft unless the model's own sampler could never pick it there (probability 0
 after penalties, top-k, top-p and min-p), so the output is no longer distributed exactly as without MTP. Port of
 dual-p100-qwen-3-8-27b 09a243185, where quality matched exact on that repo's code, math and thinking evals.
-`esc+<x>` also vetoes drafts below x times the top token's probability. Same 6 prompts and seeds, rules alternated:
+`esc+<x>` also vetoes drafts below x times the top token's probability. Same 6 prompts and seeds, rules alternated
+(measured at eeb36708b, before the 2026-10-26 decode kernels, so the absolute numbers are lower than today's):
 
 | Preset | exact | escape |
 |---|---|---|
@@ -178,6 +211,14 @@ The launcher serves it in place of llama-server's built-in UI.
 - Shows decode and prompt speed for every reply, taken from the server's own timings.
 - Per-chat reasoning effort (Off / 512 / 2048 / 8192 / unlimited thinking tokens), sampling presets
   from the model card, system prompt, image attach, light/dark theme.
+- "Draft acceptance" for an MTP server: server default, exact, or escape (see above).
+- "Re-read each reply without its thinking": right after it (default) or with your next message (the old behavior).
+  The UI sends earlier replies without their thinking, so the next prompt no longer matches what the server cached
+  from the start of the last reply. The model's Gated DeltaNet layers cannot rewind, so without the re-read every
+  turn first reads the whole last reply again (once 12 minutes for a reply that kept thinking in its visible text).
+  With the default, the UI has the server read the reply as the next turn will send it (`max_tokens: 0`) while you
+  read it, and your next message only needs your new text read. The stats line then adds "re-read for the next
+  turn: N tok in S s". The cost is GPU work, and heat, for a while after each reply.
 - Settings and the current chat are kept in the browser's local storage only.
 
 If a browser shows an old page at `localhost:8080`, open `http://127.0.0.1:8080` or clear the site data.
