@@ -2521,10 +2521,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool                 iso_on = false;
     common_spec_stop_iso iso;
     std::vector<float>   s_iso;
-    // LLAMA_SPEC_ISO_EARLY=1: stop once the survival of the drafted prefix prod iso_q(q_i) < theta, decided before the
-    // next draft decode. The full rule needs step d's p1, so every early stop costs one decoded and discarded draft step
-    // (the draft head attends over the whole context: ~3-5 ms per wasted step at 8-16k tokens on a GTX 1070).
-    const bool           iso_early = [] { const char * e = getenv("LLAMA_SPEC_ISO_EARLY"); return e && atoi(e) != 0; }();
+    // Stop once the survival of the drafted prefix prod iso_q(q_i) < theta, decided before the next draft decode
+    // (default; LLAMA_SPEC_ISO_EARLY=0 restores the full rule). The full rule needs step d's p1, so every early stop costs
+    // one decoded and discarded draft step (the draft head attends over the whole context: ~3-5 ms per wasted step at
+    // 8-16k tokens on a GTX 1070); the early rule was faster on both chat (36.0 vs 34.9 t/s) and 8k prompts (31.2 vs 29.5).
+    const bool           iso_early = [] { const char * e = getenv("LLAMA_SPEC_ISO_EARLY"); return !e || atoi(e) != 0; }();
 
     bool can_defer() const {
         return !is_mem_shared && !chain_heads && !getenv("LLAMA_MTP_EAGER_CATCHUP");
