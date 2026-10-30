@@ -32,3 +32,14 @@ python draft-head\add_draft_head.py %BONSAI2%\models\Ternary-Bonsai-2-27B-PTQ1_0
 
 `ids-top64k.txt` came from `gen_texts.py` (suite dev/val answers, 3 seeds, temperature 0.7) and `rank_tokens.py`
 (those answers at weight 4 plus prompts and `corpus.txt`; unseen ids follow in id order).
+
+## Other folders
+
+- `mtp-fit/`: the MTP stop rule's tooling (see its README): `run_suite.py` (72-prompt chat suite in
+  `prompts-p100.json`, dev/val/test splits), `trace.sh` (traced runs), `fit_stop_rule.py` (fits the `tables-*.txt`;
+  `tables-n3-v6.txt` in this folder is the one in use).
+- `bench/`: the scripts behind the numbers in the commit messages. They hard-code `C:\git\0\bonsai2` and write to its
+  `results\`. `vram_probe.py` loads a server, sends one long prompt and reports VRAM, spill ("shared": ~130-150 MiB of
+  pinned memory is normal) and decode speed; `ab-dh.sh` runs the suite's test split per model; `rule-early.sh` compares
+  stop-rule variants; `fa_perf.py`, `mv_perf.py`, `pt-sweep.ps1`, `g6-sweep.ps1` are kernel microbenchmarks/sweeps;
+  `greedy_compare.py` checks greedy output against a reference build.

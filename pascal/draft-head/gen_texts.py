@@ -1,5 +1,5 @@
 # gen_texts.py OUT.jsonl: generate answers to the suite's dev/val prompts on a running llama-server and save the text
-# (prompts: mtp-fit/prompts-p100.json next to the repo; token frequencies for a trimmed MTP draft head; the test split stays held out).
+# (prompts: ../mtp-fit/prompts-p100.json; token frequencies for a trimmed MTP draft head; the test split stays held out).
 import argparse, json, os, urllib.request
 
 ap = argparse.ArgumentParser()
@@ -10,7 +10,7 @@ ap.add_argument("--seeds", default="11,12,13")
 ap.add_argument("--max-tokens", type=int, default=400)
 a = ap.parse_args()
 
-suite = [p for p in json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "mtp-fit", "prompts-p100.json"), encoding="utf-8"))
+suite = [p for p in json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "mtp-fit", "prompts-p100.json"), encoding="utf-8"))
          if p["split"] in a.splits.split(",")]
 with open(a.out, "w", encoding="utf-8") as out:
     for seed in [int(s) for s in a.seeds.split(",")]:
